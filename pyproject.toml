@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "discord-music-bot"
+version = "1.0.0"
+description = "Discord Music Bot with Suno Integration"
+authors = ["Zach <zachary@email.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+"discord.py" = {version = "^2.6.3", extras = ["voice"]}
+python-dotenv = "^1.0.0"
+yt-dlp = "^2024.7.0"
+beautifulsoup4 = "^4.12.0"
+requests = "^2.32.0"
+selenium = "^4.34.0"
+webdriver-manager = "^4.0.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.1.0"
+pytest-asyncio = "^0.23.0"
+pytest-mock = "^3.12.0"
+watchfiles = "^0.21.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
