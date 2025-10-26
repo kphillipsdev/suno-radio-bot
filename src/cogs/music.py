@@ -1,5 +1,4 @@
 # src/cogs/music.py
-
 import discord
 from discord.ext import commands, tasks
 from discord import ui, app_commands
@@ -12,6 +11,8 @@ import concurrent.futures
 import time
 import re
 import datetime
+import csv
+from pathlib import Path
 from discord.utils import escape_markdown
 
 from src.data.persistence import load_data, save_data
@@ -34,17 +35,15 @@ CLEAR_PLAYLISTS_ON_STOP   = os.getenv("CLEAR_PLAYLISTS_ON_STOP", "0") == "1"
 CLEAR_PLAYLISTS_ON_RELOAD = os.getenv("CLEAR_PLAYLISTS_ON_RELOAD", "0") == "1"
 
 # ---- Autofill (idle radio) -------------------------------------------------
-AUTOFILL_DELAY_SEC = int(os.getenv("AUTOFILL_DELAY_SEC", "30"))   # wait after finishing
-AUTOFILL_MAX_PULL  = int(os.getenv("AUTOFILL_MAX_PULL", "25"))    # how many to enqueue per fill
-DEFAULT_AUTOFILL_URL = os.getenv("DEFAULT_AUTOFILL_URL", "").strip()
-
-# ---- Feature flags ----------------------------------------------------------
-# When OFF, the autofill commands are hidden and disabled, and autofill won't trigger.
 AUTOFILL_FEATURE = os.getenv("AUTOFILL_FEATURE", "1") == "1"
+AUTOFILL_DELAY_SEC = int(os.getenv("AUTOFILL_DELAY_SEC", "30"))   # wait after finishing
+AUTOFILL_MAX_PULL  = int(os.getenv("AUTOFILL_MAX_PULL", "50"))    # how many to enqueue per fill
+DEFAULT_AUTOFILL_URL = os.getenv("DEFAULT_AUTOFILL_URL", "").strip()
+DEFAULT_AUTOFILL_CSV = os.getenv("DEFAULT_AUTOFILL_CSV", "").strip()
 
 # ---- Queue add limit (peak throttle) ---------------------------------------
 QUEUE_LIMIT_DEFAULT_ENABLED = os.getenv("QUEUE_LIMIT_DEFAULT_ENABLED", "1") == "1"
-QUEUE_LIMIT_MAX_PER_ADD = int(os.getenv("QUEUE_LIMIT_MAX_PER_ADD", "10"))  # default cap
+QUEUE_LIMIT_MAX_PER_ADD = int(os.getenv("QUEUE_LIMIT_MAX_PER_ADD", "25"))  # default cap
 QUEUE_MAX_PER_USER = int(os.getenv("QUEUE_MAX_PER_USER", "3"))  # hard cap per user in queue
 
 async def maybe_prefetch(song: dict) -> str | None:
@@ -331,13 +330,14 @@ class MusicCog(commands.Cog):
         self.auto_play_enabled = {}
         self.auto_play_tasks = {}
         self.auto_playlist_urls = {}
-
-        # feature flags (runtime)
         self._autofill_feature_on = AUTOFILL_FEATURE
+        self.autofill_seed_rows = {}
+        self._autofill_row_cursor = {}
 
         # queue limit (runtime)
         self.queue_limit_enabled = {}
         self.queue_limit_max = {}
+
 
     # ---------- moved INSIDE class ----------
     def _pick_song_from_context(self, ctx, position: int | None):
@@ -448,7 +448,10 @@ class MusicCog(commands.Cog):
         return (
             self._autofill_feature_on
             and bool(self.auto_play_enabled.get(gid))
-            and bool(self.auto_playlist_urls.get(gid))
+            and (
+                bool(self.auto_playlist_urls.get(gid)) or
+                bool(self.autofill_seed_rows.get(gid))   # NEW: CSV counts as a source
+            )
         )
 
     def _cancel_autofill_task(self, gid: int):
@@ -466,36 +469,97 @@ class MusicCog(commands.Cog):
         dq.clear()
         dq.extend(kept)
 
+    def _load_autofill_csv(self, path: str) -> list[dict]:
+        rows = []
+        if not path or not os.path.exists(path):
+            return rows
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                sniffer = csv.Sniffer()
+                sample = f.read(2048)
+                f.seek(0)
+                has_header = False
+                try:
+                    has_header = sniffer.has_header(sample)
+                except Exception:
+                    pass
+
+                reader = csv.reader(f)
+                for r in reader:
+                    if not r or all(not (c or "").strip() for c in r):
+                        continue
+                    # Try to map by header if present
+                    if has_header and reader.line_num == 1:
+                        headers = [h.strip().lower() for h in r]
+                        # normalize possible headers
+                        try:
+                            url_idx = headers.index("url")
+                        except ValueError:
+                            url_idx = 0
+                        requested_by_idx = None
+                        for cand in ("requested by", "requested_by", "requestedby", "by"):
+                            if cand in headers:
+                                requested_by_idx = headers.index(cand)
+                                break
+                        continue  # skip header row
+
+                    # Fallback: column 0 = URL, column 1 = Requested by (optional)
+                    url = (r[0] if len(r) >= 1 else "").strip()
+                    rb = (r[1] if len(r) >= 2 else "").strip()
+                    if url:
+                        rows.append({"url": url, "requested_by": rb})
+        except Exception as e:
+            print(f"[autofill CSV] Failed to load {path}: {e}")
+        return rows
     async def _enqueue_autofill_batch(self, ctx, gid: int):
-        """Scrape and resolve tracks from the configured autofill URL."""
+        """
+        Scrape/resolve tracks from either a configured playlist/profile URL,
+        or from a CSV seed list if no URL is set.
+        """
         url = (self.auto_playlist_urls.get(gid) or "").strip()
-        if not url:
-            return 0
+        # ---- Source A: URL flow (existing) ------------------------------
+        if url:
+            raw = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: scrape_suno_songs(url, limit=AUTOFILL_MAX_PULL)
+            )
+            if not raw:
+                return 0
+            random.shuffle(raw)
+            tracks = await self._resolve_tracks(raw, max_workers=6)
+        else:
+            # ---- Source B: CSV flow (NEW) --------------------------------
+            seed = self.autofill_seed_rows.get(gid) or []
+            if not seed:
+                return 0
 
-        # run sync scraper off the loop
-        raw = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: scrape_suno_songs(url, limit=AUTOFILL_MAX_PULL)
-        )
-        if not raw:
-            return 0
+            # choose up to AUTOFILL_MAX_PULL rows, randomized but fair
+            # (simple shuffle copy)
+            pick = seed[:]  # copy
+            random.shuffle(pick)
+            pick = pick[:AUTOFILL_MAX_PULL]
 
-        # Shuffle the raw order before resolving, so every fill feels fresh
-        random.shuffle(raw)
+            # Convert to minimal items for resolver: [{'url': ...}, ...]
+            raw = [{"url": r["url"], "requested_by_note": r.get("requested_by", "")} for r in pick]
+            tracks = await self._resolve_tracks(raw, max_workers=6)
 
-        tracks = await self._resolve_tracks(raw, max_workers=6)
-
-        # small shuffle again post-resolve to break any resolver ordering
+        # small shuffle to break resolver ordering
         random.shuffle(tracks)
 
         now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         for t in tracks:
-            t["_autofill"] = True                     # internal flag
-            t.setdefault("tags", []).append("filler") # simple tag list
+            t["_autofill"] = True
+            t.setdefault("tags", []).append("filler")
+            # Keep public requester as "Autofill"
             t["requester_id"] = self.bot.user.id if self.bot.user else None
             t["requester_tag"] = "Autofill"
             t["requester_name"] = "Autofill"
             t["requester_mention"] = None
             t["requested_at"] = now_ts
+
+            # Preserve non-visible CSV note (if present)
+            if "requested_by_note" not in t:
+                # carry through from raw when coming from CSV
+                pass
             self.queues[gid].append(t)
 
         save_data(gid, self.queues, self.playlists, self.user_mappings)
@@ -625,13 +689,7 @@ class MusicCog(commands.Cog):
         # Restore persisted state for each guild
         for guild in self.bot.guilds:
             loaded_queues, loaded_playlists, loaded_user_mappings = load_data(guild.id)
-            if guild.id in loaded_queues:
-                self.queues[guild.id] = loaded_queues[guild.id]
-            if guild.id in loaded_playlists:
-                self.playlists[guild.id] = loaded_playlists[guild.id]
-            if guild.id in loaded_user_mappings:
-                self.user_mappings[guild.id] = loaded_user_mappings[guild.id]
-
+            ...
             # --- restore autofill settings from user_mappings ---------------
             gid = guild.id
             amap = self.user_mappings[gid]
@@ -640,41 +698,46 @@ class MusicCog(commands.Cog):
             enabled_default = True  # autofill ON by default
 
             if isinstance(ainfo, dict):
-                # restore last URL & enabled
                 url = (ainfo.get("url") or "").strip()
                 enabled = bool(ainfo.get("enabled", enabled_default))
+                # NEW: support persisted CSV field (optional)
+                csv_path = (ainfo.get("csv") or "").strip() if isinstance(ainfo, dict) else ""
+
                 if url:
                     self.auto_playlist_urls[gid] = url
                 self.auto_play_enabled[gid] = enabled
+
+                # If no URL but CSV saved, load it
+                if not url and csv_path:
+                    self.autofill_seed_rows[gid] = self._load_autofill_csv(csv_path)
             else:
-                # initialize map
                 if not isinstance(amap, dict):
                     amap = {}
                     self.user_mappings[gid] = amap
                 self.auto_play_enabled[gid] = enabled_default
 
-            # If no saved URL, try DEFAULT_AUTOFILL_URL and persist it so it survives restarts
-            if not self.auto_playlist_urls.get(gid) and DEFAULT_AUTOFILL_URL:
-                self.auto_playlist_urls[gid] = DEFAULT_AUTOFILL_URL
-                # write-through to persistence
-                amap = self.user_mappings[gid]
-                amap["autofill"] = {
-                    "url": DEFAULT_AUTOFILL_URL,
-                    "enabled": self.auto_play_enabled.get(gid, enabled_default),
-                }
-                save_data(gid, self.queues, self.playlists, self.user_mappings)
-
-            # --- restore queue limit settings --------------------------------
-            linfo = amap.get("queue_limit") if isinstance(amap, dict) else None
-            if isinstance(linfo, dict):
-                self.queue_limit_enabled[gid] = bool(linfo.get("enabled", QUEUE_LIMIT_DEFAULT_ENABLED))
-                self.queue_limit_max[gid] = int(linfo.get("max", QUEUE_LIMIT_MAX_PER_ADD))
-            else:
-                self.queue_limit_enabled[gid] = QUEUE_LIMIT_DEFAULT_ENABLED
-                self.queue_limit_max[gid] = QUEUE_LIMIT_MAX_PER_ADD
-
-        # apply feature visibility after commands are bound
-        self._apply_feature_visibility()
+            # If nothing saved, prefer DEFAULT_AUTOFILL_URL, else DEFAULT_AUTOFILL_CSV
+            if not self.auto_playlist_urls.get(gid):
+                if DEFAULT_AUTOFILL_URL:
+                    self.auto_playlist_urls[gid] = DEFAULT_AUTOFILL_URL
+                    # persist URL choice
+                    amap = self.user_mappings[gid]
+                    amap["autofill"] = {
+                        "url": DEFAULT_AUTOFILL_URL,
+                        "enabled": self.auto_play_enabled.get(gid, enabled_default),
+                    }
+                    save_data(gid, self.queues, self.playlists, self.user_mappings)
+                elif DEFAULT_AUTOFILL_CSV:
+                    rows = self._load_autofill_csv(DEFAULT_AUTOFILL_CSV)
+                    if rows:
+                        self.autofill_seed_rows[gid] = rows
+                        # persist CSV choice
+                        amap = self.user_mappings[gid]
+                        amap["autofill"] = {
+                            "csv": DEFAULT_AUTOFILL_CSV,
+                            "enabled": self.auto_play_enabled.get(gid, enabled_default),
+                        }
+                        save_data(gid, self.queues, self.playlists, self.user_mappings)
 
     async def cog_unload(self):
         """Clean up resources when the cog is unloaded/reloaded."""
@@ -1502,15 +1565,134 @@ class MusicCog(commands.Cog):
 
         await ctx.send(embed=discord.Embed(
             title="ℹ️ Autofill Status",
-            description=f"**Feature:** {'ON' if self._autofill_feature_on else 'OFF'}\n"
-                        f"**State:** {'Enabled' if enabled else 'Disabled'}\n"
+            description=f"**State:** {'Enabled' if enabled else 'Disabled'}\n"
                         f"**Source:** {src_str}\n"
                         f"**Delay:** {AUTOFILL_DELAY_SEC}s",
             color=0x7289DA
         ))
 
-    # ========== Queue limit commands (Admin) =================================
+    # ========== Autofill CSV: force reload (Admin) ===========================
+    @commands.has_permissions(administrator=True)
+    @commands.command(name="autofill_csv_reload")
+    async def autofill_csv_reload(self, ctx):
+        """
+        Force reload of the Autofill CSV (Admin only).
+        If your bot caches the CSV (mtime-based), this resets the cache and reloads now.
+        """
+        # Make sure attributes exist even if older builds didn't define them
+        if not hasattr(self, "_autofill_csv_path"):
+            self._autofill_csv_path = os.getenv("AUTOFILL_CSV_PATH", "autofill.csv")
+        if not hasattr(self, "_autofill_csv_cache"):
+            self._autofill_csv_cache = []
+        if not hasattr(self, "_autofill_csv_last_mtime"):
+            self._autofill_csv_last_mtime = 0.0
 
+        path = self._autofill_csv_path
+
+        # Reset cache markers so a reload will actually happen
+        self._autofill_csv_cache = []
+        self._autofill_csv_last_mtime = 0.0
+
+        loaded = 0
+        err = None
+
+        # Prefer your project’s loader if it exists
+        try:
+            if hasattr(self, "_load_autofill_csv") and callable(self._load_autofill_csv):
+                # Implemented earlier: returns list[dict] (each with at least "url", maybe "requested_by")
+                data = await self._load_autofill_csv(force=True)  # type: ignore
+                self._autofill_csv_cache = data or []
+                loaded = len(self._autofill_csv_cache)
+                # Update mtime if file exists
+                try:
+                    self._autofill_csv_last_mtime = os.path.getmtime(path)
+                except Exception:
+                    pass
+            else:
+                # Minimal inline loader (URL,Requested by) -> cache as dicts
+                import csv
+                rows = []
+                with open(path, "r", encoding="utf-8") as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if not row:
+                            continue
+                        url = (row[0] or "").strip()
+                        req = (row[1] or "").strip() if len(row) > 1 else ""
+                        if not url or url.startswith("#"):
+                            continue
+                        rows.append({"url": url, "requested_by": req})
+                self._autofill_csv_cache = rows
+                loaded = len(rows)
+                try:
+                    self._autofill_csv_last_mtime = os.path.getmtime(path)
+                except Exception:
+                    pass
+
+        except FileNotFoundError:
+            err = f"CSV not found at `{path}`."
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+
+        if err:
+            await ctx.send(embed=discord.Embed(
+                title="❌ Autofill CSV Reload Failed",
+                description=err,
+                color=0xe74c3c
+            ))
+            return
+
+        await ctx.send(embed=discord.Embed(
+            title="✅ Autofill CSV Reloaded",
+            description=f"Loaded **{loaded}** entries from `{path}`.",
+            color=0x2ecc71
+        ))
+
+    # ========== Autofill: unset URL override (Admin) =========================
+    @commands.has_permissions(administrator=True)
+    @commands.command(name="autofill_unset")
+    async def autofill_unset(self, ctx):
+        """
+        Unset the saved playlist/profile URL so CSV becomes the source again (Admin only).
+        Keeps the 'enabled' flag; just removes the URL override.
+        """
+        gid = ctx.guild.id
+
+        # Clear runtime URL
+        if gid in self.auto_playlist_urls:
+            try:
+                # remove key entirely to fall back to CSV/DEFAULT
+                self.auto_playlist_urls.pop(gid, None)
+            except Exception:
+                self.auto_playlist_urls[gid] = ""
+
+        # Persist change into user_mappings
+        amap = self.user_mappings.get(gid)
+        if not isinstance(amap, dict):
+            amap = {}
+            self.user_mappings[gid] = amap
+
+        ainfo = amap.get("autofill", {})
+        # Keep enabled as-is, just drop the url
+        enabled_state = bool(self.auto_play_enabled.get(gid, ainfo.get("enabled", True)))
+        ainfo["enabled"] = enabled_state
+        ainfo["url"] = ""  # blank means "no page override"
+        amap["autofill"] = ainfo
+
+        save_data(gid, self.queues, self.playlists, self.user_mappings)
+
+        desc_lines = [
+            "Cleared the **autofill URL override**.",
+            f"**Enabled:** {'Yes' if enabled_state else 'No'}",
+            "Source will now come from the **CSV** (or `DEFAULT_AUTOFILL_URL` if CSV is not set)."
+        ]
+        await ctx.send(embed=discord.Embed(
+            title="🔄 Autofill Source Unset",
+            description="\n".join(desc_lines),
+            color=0x3498db
+        ))
+
+    # ========== Queue limit commands (Admin) =================================
     @commands.has_permissions(administrator=True)
     @commands.command(name="queue_limit_on")
     async def queue_limit_on(self, ctx):
