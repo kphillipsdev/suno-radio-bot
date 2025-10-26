@@ -337,7 +337,7 @@ class MusicCog(commands.Cog):
         # queue limit (runtime)
         self.queue_limit_enabled = {}
         self.queue_limit_max = {}
-
+        self.queue_per_user_max = {}
 
     # ---------- moved INSIDE class ----------
     def _pick_song_from_context(self, ctx, position: int | None):
@@ -416,17 +416,16 @@ class MusicCog(commands.Cog):
         return n
 
     def _user_slots_remaining(self, gid: int, user_id: int) -> int:
-        """
-        How many more tracks the user may add before hitting QUEUE_MAX_PER_USER.
-        """
+        """How many more tracks the user may add before hitting per-user cap."""
         have = self._count_user_queued(gid, user_id, include_filler=False)
-        return max(0, int(QUEUE_MAX_PER_USER) - have)
+        return max(0, self._per_user_max(gid) - have)
 
-    def _deny_user_cap_embed(self, requester_mention: str | None = None) -> discord.Embed:
+    def _deny_user_cap_embed(self, requester_mention: str | None = None, gid: int | None = None) -> discord.Embed:
+        cap = self._per_user_max(gid) if gid is not None else QUEUE_MAX_PER_USER
         who = requester_mention or "You"
         return discord.Embed(
             title="🚫 Per-User Queue Limit",
-            description=f"{who} already {'have' if requester_mention else 'has'} **{QUEUE_MAX_PER_USER}** song(s) in the queue. "
+            description=f"{who} already {'have' if requester_mention else 'has'} **{cap}** song(s) in the queue. "
                         f"Please wait until one finishes before adding more.",
             color=0xe74c3c
         )
@@ -601,10 +600,13 @@ class MusicCog(commands.Cog):
 
     # ===== Queue add limit helpers ==========================================
     def _limit_is_on(self, gid: int) -> bool:
-        return bool(self.queue_limit_enabled.get(gid))
+        return bool(self.queue_limit_enabled.get(gid, QUEUE_LIMIT_DEFAULT_ENABLED))
 
     def _limit_max(self, gid: int) -> int:
         return int(self.queue_limit_max.get(gid, QUEUE_LIMIT_MAX_PER_ADD))
+
+    def _per_user_max(self, gid: int) -> int:
+        return int(self.queue_per_user_max.get(gid, QUEUE_MAX_PER_USER))
 
     def _enforce_queue_add_limit(self, gid: int, intended_count: int) -> tuple[int, str | None]:
         """
@@ -689,7 +691,13 @@ class MusicCog(commands.Cog):
         # Restore persisted state for each guild
         for guild in self.bot.guilds:
             loaded_queues, loaded_playlists, loaded_user_mappings = load_data(guild.id)
-            ...
+            if guild.id in loaded_queues:
+                self.queues[guild.id] = loaded_queues[guild.id]
+            if guild.id in loaded_playlists:
+                self.playlists[guild.id] = loaded_playlists[guild.id]
+            if guild.id in loaded_user_mappings:
+                self.user_mappings[guild.id] = loaded_user_mappings[guild.id]
+
             # --- restore autofill settings from user_mappings ---------------
             gid = guild.id
             amap = self.user_mappings[gid]
@@ -861,12 +869,12 @@ class MusicCog(commands.Cog):
 
                 # NEW: per-user remaining slots
                 if remaining_user_slots <= 0:
-                    await ctx.send(embed=self._deny_user_cap_embed(requester_mention))
+                    await ctx.send(embed=self._deny_user_cap_embed(requester_mention, gid=guild_id))
                     return
 
                 allowed_total = min(allowed_by_add, remaining_user_slots)
                 if allowed_total <= 0:
-                    await ctx.send(embed=self._deny_user_cap_embed(requester_mention))
+                    await ctx.send(embed=self._deny_user_cap_embed(requester_mention, gid=guild_id))
                     return
                 if allowed_total < intended:
                     raw_tracks = raw_tracks[:allowed_total]
@@ -1212,10 +1220,10 @@ class MusicCog(commands.Cog):
                 ctx.voice_client.source.volume = self.volumes[guild_id]
 
     @commands.command(name='playlist')
-    @commands.has_permissions(administrator=True)
+    @commands.has_permissions(administrator=False)
     async def playlist(self, ctx, url: str, max_items: int = 100):
         """
-        Enqueue tracks from a Suno playlist/profile/handle in bulk (Admin only)
+        Enqueue tracks from a Suno playlist/profile/handle in bulk
         Usage: !playlist https://suno.com/playlist/##"
         """
         if not ctx.voice_client:
@@ -1565,7 +1573,8 @@ class MusicCog(commands.Cog):
 
         await ctx.send(embed=discord.Embed(
             title="ℹ️ Autofill Status",
-            description=f"**State:** {'Enabled' if enabled else 'Disabled'}\n"
+            description=f"**Feature:** {'ON' if self._autofill_feature_on else 'OFF'}\n"
+                        f"**State:** {'Enabled' if enabled else 'Disabled'}\n"
                         f"**Source:** {src_str}\n"
                         f"**Delay:** {AUTOFILL_DELAY_SEC}s",
             color=0x7289DA
@@ -1715,43 +1724,74 @@ class MusicCog(commands.Cog):
 
     @commands.has_permissions(administrator=True)
     @commands.command(name="queue_limit_off")
-    async def queue_limit_off(self, ctx):
+    async def queue_limit_off(self, ctx, per_user_max: int | None = None):
         """
-        Turn the queue limit off (Admin only)
+        Turn the queue limit off (Admin only).
+        Optionally also set the per-user cap while limits are off, e.g. !queue_limit_off 5
         """
         gid = ctx.guild.id
         self.queue_limit_enabled[gid] = False
+
+        # NEW: optionally update per-user cap
+        if per_user_max is not None:
+            per_user_max = max(1, int(per_user_max))
+            self.queue_per_user_max[gid] = per_user_max
+
         amap = self.user_mappings[gid]
         if not isinstance(amap, dict):
             amap = {}
             self.user_mappings[gid] = amap
-        amap["queue_limit"] = {"enabled": False, "max": self._limit_max(gid)}
+
+        # persist both values, including per_user_max
+        amap["queue_limit"] = {
+            "enabled": False,
+            "max": self._limit_max(gid),
+            "per_user_max": self._per_user_max(gid),
+        }
         save_data(gid, self.queues, self.playlists, self.user_mappings)
         await ctx.send(embed=discord.Embed(
             title="📦 Queue Limit",
-            description="Queue limit is **OFF**.",
+            description=f"Queue limit is **OFF**.\nPer-user cap: **{self._per_user_max(gid)}**",
             color=0xe67e22
         ))
 
+
     @commands.has_permissions(administrator=True)
     @commands.command(name="queue_limit_set")
-    async def queue_limit_set(self, ctx, max_per_add: int):
+    async def queue_limit_set(self, ctx, max_per_add: int, per_user_max: int | None = None):
         """
-        Set the queue limit amount (Admin only)
+        Set the queue limit amount (Admin only).
+        Usage:
+          !queue_limit_set 5 -> sets max per add to 5, leaves per-user cap as-is
+          !queue_limit_set 5 3 -> sets max per add to 5 and per-user cap to 3
         """
         gid = ctx.guild.id
         max_per_add = max(1, int(max_per_add))
         self.queue_limit_max[gid] = max_per_add
+
+        # NEW: optional per-user cap update
+        if per_user_max is not None:
+            per_user_max = max(1, int(per_user_max))
+            self.queue_per_user_max[gid] = per_user_max
+
         amap = self.user_mappings[gid]
         if not isinstance(amap, dict):
             amap = {}
             self.user_mappings[gid] = amap
         enabled = self._limit_is_on(gid)
-        amap["queue_limit"] = {"enabled": enabled, "max": max_per_add}
+        amap["queue_limit"] = {
+            "enabled": enabled,
+            "max": max_per_add,
+            "per_user_max": self._per_user_max(gid),  # persist live cap
+        }
         save_data(gid, self.queues, self.playlists, self.user_mappings)
+
+        # Nice summary
+        desc = [f"Max songs per add set to **{max_per_add}**."]
+        desc.append(f"Per-user cap: **{self._per_user_max(gid)}**")
         await ctx.send(embed=discord.Embed(
             title="📦 Queue Limit",
-            description=f"Max songs per add set to **{max_per_add}**.",
+            description="\n".join(desc),
             color=0x3498db
         ))
 
@@ -1763,10 +1803,12 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         enabled = self._limit_is_on(gid)
         maxn = self._limit_max(gid)
-        per_user_cap = int(QUEUE_MAX_PER_USER)
+        per_user_cap = self._per_user_max(gid)  # NEW: from persistence/runtime
         await ctx.send(embed=discord.Embed(
             title="ℹ️ Queue Limit Status",
-            description=f"**State:** {'ON' if enabled else 'OFF'}\n**Max per add:** {maxn}\n**Max per user:** {per_user_cap}",
+            description=f"**State:** {'ON' if enabled else 'OFF'}\n"
+                        f"**Max per add:** {maxn}\n"
+                        f"**Max per user:** {per_user_cap}",
             color=0x7289DA
         ))
 
