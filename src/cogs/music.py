@@ -25,7 +25,7 @@ EMBED_COLOR_PLAYING = 0x580fd6
 EMBED_COLOR_ADDED   = 0xc1d4d6
 
 # ---- Prefetch config (env-driven) ------------------------------------------
-PREFETCH_MODE    = os.getenv("PREFETCH_MODE", "full").lower()  # "none" | "warmup" | "full"
+PREFETCH_MODE    = os.getenv("PREFETCH_MODE", "warmup").lower()  # "none" | "warmup" | "full"
 PREFETCH_BYTES   = int(os.getenv("PREFETCH_BYTES", "524288"))  # ~512 KB for warmup
 PREFETCH_TIMEOUT = int(os.getenv("PREFETCH_TIMEOUT", "25"))    # seconds
 PREFETCH_DIR     = os.getenv("PREFETCH_DIR", "songs") or "songs"
@@ -45,6 +45,9 @@ DEFAULT_AUTOFILL_CSV = os.getenv("DEFAULT_AUTOFILL_CSV", "").strip()
 QUEUE_LIMIT_DEFAULT_ENABLED = os.getenv("QUEUE_LIMIT_DEFAULT_ENABLED", "1") == "1"
 QUEUE_LIMIT_MAX_PER_ADD = int(os.getenv("QUEUE_LIMIT_MAX_PER_ADD", "25"))  # default cap
 QUEUE_MAX_PER_USER = int(os.getenv("QUEUE_MAX_PER_USER", "3"))  # hard cap per user in queue
+
+# ---- Now Playing retention --------------------------------------------------
+REMOVE_NP_AFTER_SONGS = int(os.getenv("REMOVE_NP_AFTER_SONGS", "2"))  # delete NP embeds after N further songs
 
 async def maybe_prefetch(song: dict) -> str | None:
     """
@@ -108,6 +111,31 @@ def _fmt_duration(d):
     except Exception:
         return str(d)
 
+def _duration_to_seconds(d) -> int | None:
+    """Return total seconds from int/float or 'HH:MM:SS'/'MM:SS' strings. None if unknown."""
+    if d is None:
+        return None
+    if isinstance(d, (int, float)):
+        return max(0, int(d))
+    s = str(d).strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(parts) == 3:
+        h, m, sec = parts
+        return max(0, h * 3600 + m * 60 + sec)
+    if len(parts) == 2:
+        m, sec = parts
+        return max(0, m * 60 + sec)
+    try:
+        return max(0, int(s))
+    except ValueError:
+        return None
+
 def _truncate(text: str | None, limit: int = 300) -> str:
     if not text:
         return "—"
@@ -156,7 +184,7 @@ def _filler_badge(track: dict) -> str:
     """
     Returns a short inline badge for autofill tracks.
     """
-    return "  *(~filler~)*" if track.get("_autofill") else ""
+    return "  *(autoplay)*" if track.get("_autofill") else ""
 
 def _prompt_text(track: dict) -> str:
     # Prefer 'prompt' if present, otherwise fall back to common fields
@@ -249,10 +277,16 @@ def build_now_playing_embed(track: dict, requester_mention: str | None, upcoming
     embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
     return embed
 
-def build_added_embed(track: dict, requester_mention: str | None, position: int | None = None):
+def build_added_embed(
+    track: dict,
+    requester_mention: str | None,
+    position: int | None = None,
+    eta_seconds: int | None = None,
+    eta_unknown: bool = False
+):
     """
     Added card: heading = song title (clickable), body = artist,
-    fields = Duration, Requested by (with original request time), Position if provided.
+    fields = Duration, Requested by (with original request time), Position (+ ETA).
     """
     desc = [
         _track_title_link(track) + _filler_badge(track),
@@ -264,7 +298,6 @@ def build_added_embed(track: dict, requester_mention: str | None, position: int 
         description="\n".join([s for s in desc if s is not None]),
         color=EMBED_COLOR_ADDED
     )
-    # Core fields
     embed.add_field(name="Duration", value=_fmt_duration(track.get("duration")), inline=True)
 
     ts = int(track.get("requested_at") or datetime.datetime.now(datetime.timezone.utc).timestamp())
@@ -272,14 +305,20 @@ def build_added_embed(track: dict, requester_mention: str | None, position: int 
     embed.add_field(name="Requested by", value=req_val, inline=True)
 
     if isinstance(position, int) and position >= 1:
-        embed.add_field(name="Position", value=f"#{position}", inline=False)
+        eta_label = None
+        if eta_seconds is not None:
+            eta_label = _fmt_duration(max(0, int(eta_seconds)))
+        elif eta_unknown:
+            eta_label = "≈unknown"
+
+        pos_val = f"#{position}" + (f" (Up in ~{eta_label})" if eta_label else "")
+        embed.add_field(name="Position", value=pos_val, inline=False)
 
     thumb = _thumb(track)
     if thumb:
         embed.set_thumbnail(url=thumb)
 
     return embed
-
 
 # ---- Song Info helpers (module scope) --------------------------------------
 def _render_song_header(song: dict) -> str:
@@ -339,7 +378,6 @@ class MusicCog(commands.Cog):
         self.queue_limit_max = {}
         self.queue_per_user_max = {}
 
-    # ---------- moved INSIDE class ----------
     def _pick_song_from_context(self, ctx, position: int | None):
         """
         Return (song_dict, label) from current song or queue position.
@@ -397,7 +435,40 @@ class MusicCog(commands.Cog):
         if not song.get("suno_url") and info.get("suno_url"):
             song["suno_url"] = info["suno_url"]
         return song
-    # ---------- end moved helpers ----------
+
+    def _estimate_eta_seconds(self, gid: int, position: int) -> tuple[int | None, bool]:
+        """
+        Estimate seconds until the song at given 1-based queue position starts.
+        Returns (eta_seconds or None if unknown, had_unknown_durations).
+        """
+        eta = 0
+        had_unknown = False
+        had_known = False
+
+        # Remaining time of the current song (if any)
+        if self.current_song and self.song_start_time:
+            cur_dur = _duration_to_seconds(self.current_song.get("duration"))
+            if cur_dur is None:
+                had_unknown = True
+            else:
+                elapsed = int(max(0, time.time() - self.song_start_time))
+                eta += max(0, cur_dur - elapsed)
+                had_known = True
+
+        # Sum durations of tracks ahead in queue (position is 1-based after append)
+        q = self.queues.get(gid, deque())
+        ahead = list(q)[:max(0, position - 1)]
+        for t in ahead:
+            td = _duration_to_seconds(t.get("duration"))
+            if td is None:
+                had_unknown = True
+            else:
+                eta += td
+                had_known = True
+
+        if not had_known and had_unknown:
+            return None, True
+        return eta, had_unknown
 
     def _count_user_queued(self, gid: int, user_id: int, include_filler: bool = False) -> int:
         """
@@ -430,17 +501,35 @@ class MusicCog(commands.Cog):
             color=0xe74c3c
         )
 
-    # ===== Feature visibility =================================================
-    def _apply_feature_visibility(self):
+    def _queue_eta_list(self, gid: int) -> list[int | None]:
         """
-        Hide/disable commands for features that are OFF.
-        Your custom HelpCommand already skips hidden/disabled.
+        For the current queue (1-based positions), return a list of ETA-to-start (in seconds)
+        for each item, measured from *now*. Includes remaining time of the current song first.
+        If any duration is unknown, that item's ETA may be None.
         """
-        autofill_names = {"autofill_set", "autofill_on", "autofill_off", "autofill_status"}
-        for cmd in self.get_commands():
-            if cmd.name in autofill_names:
-                cmd.hidden = not self._autofill_feature_on
-                cmd.enabled = self._autofill_feature_on
+        etas: list[int | None] = []
+        # base is remaining time of the current track (if any)
+        base = 0
+        if self.current_song and self.song_start_time:
+            cur = _duration_to_seconds(self.current_song.get("duration"))
+            if cur is not None:
+                elapsed = int(max(0, time.time() - self.song_start_time))
+                base = max(0, cur - elapsed)
+            else:
+                # current duration unknown -> all ETAs unknown
+                return [None for _ in range(len(self.queues.get(gid, [])))]
+
+        acc = base
+        q = list(self.queues.get(gid, []))
+        for t in q:
+            etas.append(acc if acc is not None else None)
+            d = _duration_to_seconds(t.get("duration"))
+            if d is None:
+                acc = None
+            else:
+                if acc is not None:
+                    acc += d
+        return etas
 
     # ===== AUTOFILL (Idle Radio) ============================================
     def _is_autofill_enabled(self, gid: int) -> bool:
@@ -671,7 +760,7 @@ class MusicCog(commands.Cog):
             current_time = self.format_time(elapsed_seconds)
             total_time = self.format_time(duration)
 
-            activity_name = f"🎵 {title} - {current_time} / {total_time}"
+            activity_name = f"🎶 {title} - {current_time} / {total_time}"
             activity = discord.Activity(
                 type=discord.ActivityType.listening,
                 name=activity_name[:128]
@@ -923,10 +1012,17 @@ class MusicCog(commands.Cog):
                     return
 
                 queue.append(song)
-                position = len(queue)  # position after append
+                position = len(queue)
                 save_data(guild_id, self.queues, self.playlists, self.user_mappings)
 
-                embed = build_added_embed(song, requester_mention=requester_mention, position=position)
+                eta_sec, eta_unknown = self._estimate_eta_seconds(guild_id, position)
+                embed = build_added_embed(
+                    song,
+                    requester_mention=requester_mention,
+                    position=position,
+                    eta_seconds=eta_sec,
+                    eta_unknown=eta_unknown
+                )
                 await ctx.send(embed=embed)
 
             if not ctx.voice_client.is_playing():
@@ -1052,7 +1148,7 @@ class MusicCog(commands.Cog):
     @commands.command(name='queue')
     async def show_queue(self, ctx):
         """
-        Shows the current queue
+        Shows the current queue with estimated time to start for each item.
         """
         guild_id = ctx.guild.id
         queue = self.queues[guild_id]
@@ -1065,16 +1161,24 @@ class MusicCog(commands.Cog):
             await ctx.send(embed=embed)
             return
 
+        # Compute ETAs for each queued item (relative to now)
+        eta_list = self._queue_eta_list(guild_id)
+
         max_lines = 15
         lines = []
-        for i, song in enumerate(queue, start=1):
+        for i, (song, eta_sec) in enumerate(zip(queue, eta_list), start=1):
             title_link = _track_title_link(song) + _filler_badge(song)
             requester = (song.get("requester_mention")
                          or (f"<@{song['requester_id']}>" if song.get("requester_id") else None)
                          or song.get("requester_tag")
                          or song.get("requester_name")
                          or "someone")
-            lines.append(f"{i}. {title_link} • requested by {requester}")
+            if eta_sec is None:
+                eta_str = "≈unknown"
+            else:
+                eta_str = _fmt_duration(max(0, int(eta_sec)))
+
+            lines.append(f"{i}. {title_link} • Up in ~{eta_str} • requested by {requester}")
             if i >= max_lines:
                 break
 
@@ -1095,7 +1199,7 @@ class MusicCog(commands.Cog):
         Skip the currently playing track.
         Usage:
           !skip             -> skip current track (any)
-          !skip filler      -> if current is filler, stop it; also purge filler from queue
+          !skip autofill    -> if current is filler, stop it; also purge filler from queue
         """
         gid = ctx.guild.id
         target = (target or "").strip().lower()
@@ -1119,7 +1223,7 @@ class MusicCog(commands.Cog):
             return removed
 
         # Special mode: skip & purge filler
-        if target == "filler":
+        if target == "autofill":
             removed_current = False
             if self.current_song and self.current_song.get("_autofill") and ctx.voice_client and ctx.voice_client.is_playing():
                 ctx.voice_client.stop()
@@ -1129,14 +1233,14 @@ class MusicCog(commands.Cog):
 
             desc = []
             if removed_current:
-                desc.append("Skipped the **current filler** track.")
+                desc.append("Skipped the **current autofill** track.")
             if removed_queued:
-                desc.append(f"🧹 Removed **{removed_queued}** filler track(s) from the queue.")
+                desc.append(f"🧹 Removed **{removed_queued}** autofill track(s) from the queue.")
             if not desc:
-                desc.append("No filler tracks were playing or queued.")
+                desc.append("No autofill tracks were playing or queued.")
 
             await ctx.send(embed=discord.Embed(
-                title="📻 Filler Skip",
+                title="📻 Autofill Skip",
                 description="\n".join(desc),
                 color=0x9b59b6
             ))
@@ -1166,6 +1270,7 @@ class MusicCog(commands.Cog):
         if CLEAR_PLAYLISTS_ON_STOP:
             self.playlists[gid].clear()
 
+        # Cancel any pending autofill task and remove filler already queued
         self._cancel_autofill_task(gid)
         self._clear_autofill_from_queue(gid)
 
@@ -1182,6 +1287,14 @@ class MusicCog(commands.Cog):
             msg += " (Playlists cleared)"
         embed = discord.Embed(title="⏹️ Stopped", description=msg, color=0xff0000)
         await ctx.send(embed=embed)
+
+        # Start idle-radio (autofill) after a stop, if feature is enabled and a source exists
+        try:
+            if self._is_autofill_enabled(gid):
+                # Use the configured delay; set to 0 for instant resume if you prefer
+                self._schedule_autofill_if_idle(ctx, delay=AUTOFILL_DELAY_SEC)
+        except Exception as _e:
+            print(f"[autofill after stop] {_e}")
 
     @commands.command(name='shuffle')
     async def shuffle_queue(self, ctx):
@@ -1298,59 +1411,59 @@ class MusicCog(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-    @commands.hybrid_command(name='add_user_songs', description='Add songs from a Suno user profile')
-    @commands.has_permissions(administrator=False)
-    async def add_user_songs(self, ctx, suno_username: str):
-        """
-        Add songs from a Suno user profile (Admin Only)
-        """
-        guild_id = ctx.guild.id
-        src = suno_username.strip()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            song_links = await asyncio.get_event_loop().run_in_executor(
-                executor, scrape_suno_songs, src, 100
-            )
-
-        if not song_links:
-            embed = discord.Embed(
-                title="❌ No Songs Found",
-                description=f"No songs scraped from '{suno_username}'. Page may require JS login or be private.",
-                color=0xff0000
-            )
-            await ctx.send(embed=embed)
-            return
-
-        # enforce queue add limit (bulk)
-        intended = len(song_links)
-        allowed, notice = self._enforce_queue_add_limit(guild_id, intended)
-        if allowed <= 0:
-            await ctx.send(embed=discord.Embed(
-                title="🚫 Queue Limit",
-                description=notice or "Queue limit reached for bulk adds.",
-                color=0xe74c3c
-            ))
-            return
-        if allowed < intended:
-            song_links = song_links[:allowed]
-
-        for song in song_links:
-            try:
-                song_info = extract_song_info(song['url'])
-                song.update(song_info)
-            except Exception as e:
-                print(f"Error extracting song info for {song.get('title','Untitled')}: {e}")
-        self.playlists[guild_id]['default'].extend(song_links)
-        save_data(guild_id, self.queues, self.playlists, self.user_mappings)
-
-        desc = f"Added {len(song_links)} songs from '{suno_username}' to default playlist! Use !load_playlist default to play."
-        if notice:
-            desc += f"\n\n{notice}"
-        embed = discord.Embed(
-            title="🎵 Added User Songs",
-            description=desc,
-            color=0x00ff00
-        )
-        await ctx.send(embed=embed)
+#     @commands.hybrid_command(name='add_user_songs', description='Add songs from a Suno user profile')
+#     @commands.has_permissions(administrator=False)
+#     async def add_user_songs(self, ctx, suno_username: str):
+#         """
+#         Add songs from a Suno user profile (Admin Only)
+#         """
+#         guild_id = ctx.guild.id
+#         src = suno_username.strip()
+#         with concurrent.futures.ThreadPoolExecutor() as executor:
+#             song_links = await asyncio.get_event_loop().run_in_executor(
+#                 executor, scrape_suno_songs, src, 100
+#             )
+#
+#         if not song_links:
+#             embed = discord.Embed(
+#                 title="❌ No Songs Found",
+#                 description=f"No songs scraped from '{suno_username}'. Page may require JS login or be private.",
+#                 color=0xff0000
+#             )
+#             await ctx.send(embed=embed)
+#             return
+#
+#         # enforce queue add limit (bulk)
+#         intended = len(song_links)
+#         allowed, notice = self._enforce_queue_add_limit(guild_id, intended)
+#         if allowed <= 0:
+#             await ctx.send(embed=discord.Embed(
+#                 title="🚫 Queue Limit",
+#                 description=notice or "Queue limit reached for bulk adds.",
+#                 color=0xe74c3c
+#             ))
+#             return
+#         if allowed < intended:
+#             song_links = song_links[:allowed]
+#
+#         for song in song_links:
+#             try:
+#                 song_info = extract_song_info(song['url'])
+#                 song.update(song_info)
+#             except Exception as e:
+#                 print(f"Error extracting song info for {song.get('title','Untitled')}: {e}")
+#         self.playlists[guild_id]['default'].extend(song_links)
+#         save_data(guild_id, self.queues, self.playlists, self.user_mappings)
+#
+#         desc = f"Added {len(song_links)} songs from '{suno_username}' to default playlist! Use !load_playlist default to play."
+#         if notice:
+#             desc += f"\n\n{notice}"
+#         embed = discord.Embed(
+#             title="🎵 Added User Songs",
+#             description=desc,
+#             color=0x00ff00
+#         )
+#         await ctx.send(embed=embed)
 
     @commands.command(name='remove')
     async def remove_from_queue(self, ctx, position: str = ""):
@@ -1582,80 +1695,95 @@ class MusicCog(commands.Cog):
 
     # ========== Autofill CSV: force reload (Admin) ===========================
     @commands.has_permissions(administrator=True)
-    @commands.command(name="autofill_csv_reload")
-    async def autofill_csv_reload(self, ctx):
+    @commands.command(name="autofill_reload")
+    async def autofill_reload(self, ctx):
         """
-        Force reload of the Autofill CSV (Admin only).
-        If your bot caches the CSV (mtime-based), this resets the cache and reloads now.
+        Reload the Autofill CSV (Admin only) and report the total number of
+        usable song URLs found. Resolves the *active* CSV path first.
         """
-        # Make sure attributes exist even if older builds didn't define them
-        if not hasattr(self, "_autofill_csv_path"):
-            self._autofill_csv_path = os.getenv("AUTOFILL_CSV_PATH", "autofill.csv")
-        if not hasattr(self, "_autofill_csv_cache"):
-            self._autofill_csv_cache = []
-        if not hasattr(self, "_autofill_csv_last_mtime"):
-            self._autofill_csv_last_mtime = 0.0
+        gid = ctx.guild.id
 
-        path = self._autofill_csv_path
-
-        # Reset cache markers so a reload will actually happen
-        self._autofill_csv_cache = []
-        self._autofill_csv_last_mtime = 0.0
-
-        loaded = 0
-        err = None
-
-        # Prefer your project’s loader if it exists
+        # --- Resolve the active CSV path (prefer saved source) -------------------
+        csv_path = None
         try:
-            if hasattr(self, "_load_autofill_csv") and callable(self._load_autofill_csv):
-                # Implemented earlier: returns list[dict] (each with at least "url", maybe "requested_by")
-                data = await self._load_autofill_csv(force=True)  # type: ignore
-                self._autofill_csv_cache = data or []
-                loaded = len(self._autofill_csv_cache)
-                # Update mtime if file exists
-                try:
-                    self._autofill_csv_last_mtime = os.path.getmtime(path)
-                except Exception:
-                    pass
-            else:
-                # Minimal inline loader (URL,Requested by) -> cache as dicts
-                import csv
-                rows = []
-                with open(path, "r", encoding="utf-8") as f:
-                    reader = csv.reader(f)
-                    for row in reader:
-                        if not row:
-                            continue
-                        url = (row[0] or "").strip()
-                        req = (row[1] or "").strip() if len(row) > 1 else ""
-                        if not url or url.startswith("#"):
-                            continue
-                        rows.append({"url": url, "requested_by": req})
-                self._autofill_csv_cache = rows
-                loaded = len(rows)
-                try:
-                    self._autofill_csv_last_mtime = os.path.getmtime(path)
-                except Exception:
-                    pass
+            amap = self.user_mappings.get(gid) or {}
+            ainfo = amap.get("autofill") or {}
+            csv_path = (ainfo.get("csv") or "").strip()
+        except Exception:
+            csv_path = ""
 
+        if not csv_path:
+            # fallbacks: explicit env → default env used at boot → legacy attr → plain filename
+            csv_path = (
+                os.getenv("AUTOFILL_CSV_PATH", "").strip()
+                or os.getenv("DEFAULT_AUTOFILL_CSV", "").strip()
+                or getattr(self, "_autofill_csv_path", "").strip()
+                or "autofill.csv"
+            )
+
+        path = os.path.abspath(os.path.expanduser(csv_path))
+
+        # --- Load rows (simple & robust) ----------------------------------------
+        try:
+            rows = []
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                rdr = csv.reader(f)
+                first_row = True
+                for r in rdr:
+                    if not r:
+                        continue
+                    cell0 = (r[0] or "").strip()
+                    # skip optional header
+                    if first_row and cell0.lower() == "url":
+                        first_row = False
+                        continue
+                    first_row = False
+                    if not cell0 or cell0.startswith("#"):
+                        continue
+                    rows.append({"url": cell0})
         except FileNotFoundError:
-            err = f"CSV not found at `{path}`."
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-
-        if err:
             await ctx.send(embed=discord.Embed(
                 title="❌ Autofill CSV Reload Failed",
-                description=err,
+                description=f"CSV not found at `{path}`.",
+                color=0xe74c3c
+            ))
+            return
+        except Exception as e:
+            await ctx.send(embed=discord.Embed(
+                title="❌ Autofill CSV Reload Failed",
+                description=f"{type(e).__name__}: {e}",
                 color=0xe74c3c
             ))
             return
 
+        total = len(rows)
+
+        # --- Update caches so other parts see fresh data -------------------------
+        self._autofill_csv_cache = rows
+        self.autofill_seed_rows[gid] = rows[:]
+        try:
+            self._autofill_csv_last_mtime = os.path.getmtime(path)
+        except Exception:
+            pass
+
+        # --- File diagnostics to make live debugging easier ----------------------
+        try:
+            size = os.path.getsize(path)
+            mtime = int(os.path.getmtime(path))
+            diag = f"Size: {size} bytes • Updated: <t:{mtime}:t>"
+        except Exception:
+            diag = "Size/mtime unavailable"
+
         await ctx.send(embed=discord.Embed(
             title="✅ Autofill CSV Reloaded",
-            description=f"Loaded **{loaded}** entries from `{path}`.",
+            description=(
+                f"Path: `{path}`\n"
+                f"Found **{total}** song URL(s).\n"
+                f"{diag}"
+            ),
             color=0x2ecc71
         ))
+
 
     # ========== Autofill: unset URL override (Admin) =========================
     @commands.has_permissions(administrator=True)
