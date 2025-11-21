@@ -276,16 +276,20 @@ def extract_song_info(url: str) -> dict:
             title_meta = soup.find("meta", property="og:title")
             title = title_meta.get("content", "Unknown Title") if title_meta else "Unknown Title"
 
-            # Artist (heuristic)
+            # Artist (strict): take the text after the LAST "by " that appears before "(@"
             artist = None
             t_creator = soup.find("meta", attrs={"name": "description"})
             if t_creator and t_creator.get("content"):
                 c = t_creator["content"]
-                m = re.search(r"\(@\s*([^)]+?)\)|\bby\s+(.+?)(?=\s*(?:[()|.:;·-]|$))", c, re.I)
-                if m:
-                    artist = (m.group(2) or m.group(1)).strip()
-                    if artist.startswith("@"):
-                        artist = artist[1:]
+                h = re.search(r"\(\@", c)  # start of "(@handle"
+                if h:
+                    pre = c[:h.start()]  # everything before the handle block
+                    by_hits = list(re.finditer(r"\bby\s+", pre, flags=re.IGNORECASE))
+                    if by_hits:
+                        start = by_hits[-1].end()  # after the *last* "by "
+                        artist = pre[start:].strip()  # exact slice; keeps emojis/specials intact
+
+            # (optional) fallback: pull from /@handle link if no artist found
             if not artist:
                 a = soup.find("a", href=re.compile(r"^/@.+$"))
                 if a and a.has_attr("href"):
