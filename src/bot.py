@@ -371,7 +371,7 @@ class MusicHelpCommand(commands.HelpCommand):
         embed = discord.Embed(
             title=f"Help: {command.qualified_name}",
             color=self._EMBED_COLOR,
-            description=command.help or "—"
+            description=command.help or ""
         )
         embed.add_field(name="Usage", value=self._fmt_sig(command), inline=False)
 
@@ -382,7 +382,7 @@ class MusicHelpCommand(commands.HelpCommand):
                 if sc.hidden or not sc.enabled:
                     continue
                 desc = sc.brief or (sc.help.splitlines()[0] if sc.help else "—")
-                line = f"• `{sc.qualified_name} {sc.signature}` — {self._shorten(desc, self._LINE_CHAR_LIMIT)}".strip()
+                line = f"• `{sc.qualified_name} {sc.signature}`: {self._shorten(desc, self._LINE_CHAR_LIMIT)}".strip()
                 subs.append(self._shorten(line, self._LINE_CHAR_LIMIT + 20))
 
             # chunk subcommands into multiple fields if needed

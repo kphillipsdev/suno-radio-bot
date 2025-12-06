@@ -39,12 +39,20 @@ PREFETCH_TIMEOUT = int(os.getenv("PREFETCH_TIMEOUT", "25"))      # seconds
 PREFETCH_DIR     = os.getenv("PREFETCH_DIR", "songs") or "songs"
 
 # ---- Startup polish & FFmpeg tuning --------------------------------------
-PREBUFFER_SECONDS       = float(os.getenv("PREBUFFER_SECONDS", "0.75"))   # wait before play() to fill buffers
-FADE_IN_SECONDS         = float(os.getenv("FADE_IN_SECONDS", "0.25"))       # 0 disables fade-in
-FADE_IN_STEPS           = int(os.getenv("FADE_IN_STEPS", "12"))          # number of steps in the fade
-STARTUP_ADELAY_MS       = int(os.getenv("STARTUP_ADELAY_MS", "200"))     # adelay padding in ms for first packets
-FFMPEG_PROBESIZE        = os.getenv("FFMPEG_PROBESIZE", "8M")            # probe size; lower = faster start
-FFMPEG_ANALYZEDURATION  = os.getenv("FFMPEG_ANALYZEDURATION", "5M")      # analyze duration; lower = faster start
+PREBUFFER_SECONDS       = float(os.getenv("PREBUFFER_SECONDS", "0.5"))   # wait before play() to fill buffers
+FADE_IN_SECONDS         = float(os.getenv("FADE_IN_SECONDS", "0.5"))     # 0 disables fade-in
+FADE_IN_STEPS           = int(os.getenv("FADE_IN_STEPS", "20"))           # number of steps in the fade
+FADE_OUT_SECONDS        = float(os.getenv("FADE_OUT_SECONDS", "1.0"))     # 0 disables
+FADE_OUT_STEPS          = int(os.getenv("FADE_OUT_STEPS", "20"))
+STARTUP_ADELAY_MS       = int(os.getenv("STARTUP_ADELAY_MS", "200"))      # adelay padding in ms for first packets
+FFMPEG_PROBESIZE        = os.getenv("FFMPEG_PROBESIZE", "8M")             # probe size; lower = faster start
+FFMPEG_ANALYZEDURATION  = os.getenv("FFMPEG_ANALYZEDURATION", "5M")       # analyze duration; lower = faster start
+FFMPEG_THREAD_QUEUE_SIZE = int(os.getenv("FFMPEG_THREAD_QUEUE_SIZE", "1024"))
+FFMPEG_RW_TIMEOUT_US     = int(os.getenv("FFMPEG_RW_TIMEOUT_US", "15000000"))  # 15s
+FFMPEG_NOBUFFER          = os.getenv("FFMPEG_NOBUFFER", "0") == "1"
+FFMPEG_BUFFER_SIZE       = os.getenv("FFMPEG_BUFFER_SIZE", "512k")
+FFMPEG_MAX_DELAY_US      = int(os.getenv("FFMPEG_MAX_DELAY_US", "5000000"))
+VOICE_BITRATE_KBPS = int(os.getenv("VOICE_BITRATE_KBPS", "128"))
 
 # Queue/playlist clear policy toggles
 CLEAR_PLAYLISTS_ON_STOP   = os.getenv("CLEAR_PLAYLISTS_ON_STOP", "0") == "1"
@@ -56,6 +64,7 @@ AUTOFILL_DELAY_SEC = int(os.getenv("AUTOFILL_DELAY_SEC", "30"))   # wait after f
 AUTOFILL_MAX_PULL  = int(os.getenv("AUTOFILL_MAX_PULL", "50"))    # how many to enqueue per fill
 DEFAULT_AUTOFILL_URL = os.getenv("DEFAULT_AUTOFILL_URL", "").strip()
 DEFAULT_AUTOFILL_CSV = os.getenv("DEFAULT_AUTOFILL_CSV", "").strip()
+AUTOFILL_LIKES_PER_USER = int(os.getenv("AUTOFILL_LIKES_PER_USER", "5"))
 
 # ---- Queue add limit (peak throttle) ---------------------------------------
 QUEUE_LIMIT_DEFAULT_ENABLED = os.getenv("QUEUE_LIMIT_DEFAULT_ENABLED", "1") == "1"
@@ -449,7 +458,6 @@ class LikeView(discord.ui.View):
                 )
                 msg = f"Removed your like for **{self.song_title}**."
                 button.style = discord.ButtonStyle.primary
-                # Keep text-only label or show count
                 button.label = str(total) if self.show_count else "Like"
             else:
                 total = like_track(
@@ -457,10 +465,6 @@ class LikeView(discord.ui.View):
                     username=str(interaction.user),
                 )
                 msg = f"Thanks for liking **{self.song_title}**!"
-                # button.style = discord.ButtonStyle.success
-                # Keep text-only label or show count
-                # Uncomment for "Liked" text instead of "Like" when hidden:
-                # button.label = "Liked" if not self.show_count else str(total)
                 button.label = str(total) if self.show_count else "Like"
 
             await interaction.response.edit_message(view=self)
@@ -495,24 +499,101 @@ class MusicCog(commands.Cog):
         self._autofill_feature_on = AUTOFILL_FEATURE
         self.autofill_seed_rows = {}
         self._autofill_row_cursor = {}
-
-        # queue limit (runtime)
         self.queue_limit_enabled = {}
         self.queue_limit_max = {}
         self.queue_per_user_max = {}
+        self._fadeout_active = defaultdict(bool)
+
+        # --- Playback overlap guard (fixes double-play jitter) -----------------
+        self._play_locks = defaultdict(asyncio.Lock)
 
         # --- Now Playing tracking for pruning (autofill only) -----------------
-        # _song_index[gid]: monotonically increasing integer incremented on each song start
-        # _np_track[gid]: list of dicts with {message_id, channel_id, song_index, is_autofill}
         self._song_index = defaultdict(int)
         self._np_track = defaultdict(list)
         self._np_retention_n = REMOVE_NP_AFTER_SONGS
 
+    def _is_admin(self, member: discord.Member) -> bool:
+        """Admins bypass queue limitations."""
+        try:
+            perms = member.guild_permissions
+            return bool(perms.administrator or perms.manage_guild)
+        except Exception:
+            return False
+
+    async def _fade_out_and_stop(self, ctx, *, duration=None, steps=None):
+        gid = ctx.guild.id
+        vc = ctx.voice_client
+
+        # no voice client at all → nothing to fade
+        if not vc:
+            return
+
+        # allow fading if playing OR paused
+        is_active = vc.is_playing() or vc.is_paused()
+        if not is_active:
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            return
+
+        # prevent double fades
+        if self._fadeout_active[gid]:
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            return
+
+        self._fadeout_active[gid] = True
+        try:
+            d = FADE_OUT_SECONDS if duration is None else float(duration)
+            if d <= 0:
+                vc.stop()
+                return
+
+            s = FADE_OUT_STEPS if steps is None else int(steps)
+            s = max(1, s)
+
+            # get the actual PCMVolumeTransformer
+            transformer = getattr(vc, "source", None)
+            if not transformer or not hasattr(transformer, "volume"):
+                # fallback — cannot fade, just stop
+                vc.stop()
+                return
+
+            try:
+                start_vol = float(transformer.volume or 1.0)
+            except Exception:
+                start_vol = 1.0
+
+            delay = d / s
+            for i in range(s):
+                await asyncio.sleep(delay)
+                try:
+                    transformer.volume = max(0.0, start_vol * (1.0 - (i + 1) / s))
+                except Exception:
+                    break
+
+            try:
+                transformer.volume = 0.0
+            except Exception:
+                pass
+
+            vc.stop()
+
+        except Exception as e:
+            # log it to console but don't break playback system
+            print(f"[fadeout] error: {e}")
+            try:
+                vc.stop()
+            except Exception:
+                pass
+
+        finally:
+            self._fadeout_active[gid] = False
+
     def _pick_song_from_context(self, ctx, position: int | None):
-        """
-        Return (song_dict, label) from current song or queue position.
-        label is a short descriptor for embeds.
-        """
         gid = ctx.guild.id
         if position is None:
             if self.current_song:
@@ -522,7 +603,6 @@ class MusicCog(commands.Cog):
                 return q[0], "Next Up"
             return None, "No song is playing and the queue is empty."
 
-        # explicit queue position (1-based)
         try:
             idx = int(position) - 1
         except Exception:
@@ -533,10 +613,6 @@ class MusicCog(commands.Cog):
         return None, f"Invalid position. Must be between 1 and {len(q)}."
 
     async def _ensure_song_metadata(self, song: dict) -> dict:
-        """
-        If prompt/lyrics are missing, try to refresh from the Suno page (or URL we have).
-        Runs extractor in a thread.
-        """
         need_prompt = not song.get("prompt")
         need_lyrics = not song.get("lyrics")
         if not (need_prompt or need_lyrics):
@@ -567,15 +643,10 @@ class MusicCog(commands.Cog):
         return song
 
     def _estimate_eta_seconds(self, gid: int, position: int) -> tuple[int | None, bool]:
-        """
-        Estimate seconds until the song at given 1-based queue position starts.
-        Returns (eta_seconds or None if unknown, had_unknown_durations).
-        """
         eta = 0
         had_unknown = False
         had_known = False
 
-        # Remaining time of the current song (if any)
         if self.current_song and self.song_start_time:
             cur_dur = _duration_to_seconds(self.current_song.get("duration"))
             if cur_dur is None:
@@ -585,7 +656,6 @@ class MusicCog(commands.Cog):
                 eta += max(0, cur_dur - elapsed)
                 had_known = True
 
-        # Sum durations of tracks ahead in queue (position is 1-based after append)
         q = self.queues.get(gid, deque())
         ahead = list(q)[:max(0, position - 1)]
         for t in ahead:
@@ -601,10 +671,6 @@ class MusicCog(commands.Cog):
         return eta, had_unknown
 
     def _count_user_queued(self, gid: int, user_id: int, include_filler: bool = False) -> int:
-        """
-        Count how many tracks in the queue belong to a given requester.
-        By default ignores autofill/filler tracks.
-        """
         q = self.queues[gid]
         if not q:
             return 0
@@ -617,7 +683,6 @@ class MusicCog(commands.Cog):
         return n
 
     def _user_slots_remaining(self, gid: int, user_id: int) -> int:
-        """How many more tracks the user may add before hitting per-user cap."""
         have = self._count_user_queued(gid, user_id, include_filler=False)
         return max(0, self._per_user_max(gid) - have)
 
@@ -632,13 +697,7 @@ class MusicCog(commands.Cog):
         )
 
     def _queue_eta_list(self, gid: int) -> list[int | None]:
-        """
-        For the current queue (1-based positions), return a list of ETA-to-start (in seconds)
-        for each item, measured from *now*. Includes remaining time of the current song first.
-        If any duration is unknown, that item's ETA may be None.
-        """
         etas: list[int | None] = []
-        # base is remaining time of the current track (if any)
         base = 0
         if self.current_song and self.song_start_time:
             cur = _duration_to_seconds(self.current_song.get("duration"))
@@ -646,7 +705,6 @@ class MusicCog(commands.Cog):
                 elapsed = int(max(0, time.time() - self.song_start_time))
                 base = max(0, cur - elapsed)
             else:
-                # current duration unknown -> all ETAs unknown
                 return [None for _ in range(len(self.queues.get(gid, [])))]
 
         acc = base
@@ -668,7 +726,7 @@ class MusicCog(commands.Cog):
             and bool(self.auto_play_enabled.get(gid))
             and (
                 bool(self.auto_playlist_urls.get(gid)) or
-                bool(self.autofill_seed_rows.get(gid))   # NEW: CSV counts as a source
+                bool(self.autofill_seed_rows.get(gid))
             )
         )
 
@@ -679,7 +737,6 @@ class MusicCog(commands.Cog):
         self.auto_play_tasks[gid] = None
 
     def _clear_autofill_from_queue(self, gid: int):
-        """Remove any 'autofill' flagged tracks from the queue."""
         dq = self.queues[gid]
         if not dq:
             return
@@ -706,10 +763,8 @@ class MusicCog(commands.Cog):
                 for r in reader:
                     if not r or all(not (c or "").strip() for c in r):
                         continue
-                    # Try to map by header if present
                     if has_header and reader.line_num == 1:
                         headers = [h.strip().lower() for h in r]
-                        # normalize possible headers
                         try:
                             url_idx = headers.index("url")
                         except ValueError:
@@ -719,9 +774,8 @@ class MusicCog(commands.Cog):
                             if cand in headers:
                                 requested_by_idx = headers.index(cand)
                                 break
-                        continue  # skip header row
+                        continue
 
-                    # Fallback: column 0 = URL, column 1 = Requested by (optional)
                     url = (r[0] if len(r) >= 1 else "").strip()
                     rb = (r[1] if len(r) >= 2 else "").strip()
                     if url:
@@ -731,9 +785,6 @@ class MusicCog(commands.Cog):
         return rows
 
     async def _get_autofill_liked_raw(self, ctx, gid: int) -> list[dict]:
-        """Build a raw seed list from liked songs of members currently in the voice channel.
-        This returns minimal dicts suitable for _resolve_tracks (at most AUTOFILL_MAX_PULL).
-        """
         try:
             vc = ctx.voice_client
         except AttributeError:
@@ -742,44 +793,62 @@ class MusicCog(commands.Cog):
         if not vc or not getattr(vc, "channel", None):
             return []
 
-        # Collect human user IDs in the same voice channel
         members = [m for m in vc.channel.members if not getattr(m, "bot", False)]
         user_ids = [m.id for m in members]
         if not user_ids:
             return []
 
         try:
-            rows = top_liked_for_users(guild_id=gid, user_ids=user_ids, limit=AUTOFILL_MAX_PULL)
+            rows = top_liked_for_users(
+                guild_id=gid,
+                user_ids=user_ids,
+                limit=AUTOFILL_MAX_PULL * max(1, AUTOFILL_LIKES_PER_USER),
+            )
         except Exception as e:
             print(f"[autofill likes] failed to fetch liked tracks: {e}")
             return []
 
-        raw: list[dict] = []
+        by_user: dict[int, list[dict]] = defaultdict(list)
         for r in rows:
-            url = (r.get("source_url") or "").strip()
-            if not url:
-                # Skip if we somehow don't have a usable Suno page URL stored
+            uid = r.get("user_id") or r.get("liked_by") or r.get("user")
+            if uid is None:
                 continue
-            raw.append(
-                {
-                    "id": r.get("track_id"),
-                    "url": url,
-                    "suno_url": url,             # keeps _derive_suno_url happy
-                    "_liked_weight": r.get("like_count", 0),
-                }
-            )
+            try:
+                uid_int = int(uid)
+            except (TypeError, ValueError):
+                continue
+            by_user[uid_int].append(r)
 
-        # Cap to AUTOFILL_MAX_PULL just in case
-        return raw[:AUTOFILL_MAX_PULL]
+        raw: list[dict] = []
+        per_user_cap = max(1, AUTOFILL_LIKES_PER_USER)
+        for uid in user_ids:
+            user_rows = by_user.get(uid, [])
+            if not user_rows:
+                continue
+
+            random.shuffle(user_rows)
+            pick = user_rows[:per_user_cap]
+
+            for r in pick:
+                url = (r.get("source_url") or "").strip()
+                if not url:
+                    continue
+                raw.append(
+                    {
+                        "id": r.get("track_id"),
+                        "url": url,
+                        "suno_url": url,
+                        "_liked_weight": r.get("like_count", 0),
+                    }
+                )
+
+        if len(raw) > AUTOFILL_MAX_PULL:
+            random.shuffle(raw)
+            raw = raw[:AUTOFILL_MAX_PULL]
+
+        return raw
 
     async def _enqueue_autofill_batch(self, ctx, gid: int):
-        """
-        Autofill smart shuffling:
-        1. Seed from liked songs of users currently in the voice channel.
-        2. Fill the remainder from a configured playlist/profile URL or CSV seed list.
-        3. Resolve full metadata, shuffle, and enqueue as autofill tracks.
-        """
-        # Step 1: liked tracks for active VC members
         liked_raw = await self._get_autofill_liked_raw(ctx, gid)
         liked_raw = liked_raw[:AUTOFILL_MAX_PULL]
         remaining = max(0, AUTOFILL_MAX_PULL - len(liked_raw))
@@ -787,10 +856,8 @@ class MusicCog(commands.Cog):
         url = (self.auto_playlist_urls.get(gid) or "").strip()
         fallback_raw: list[dict] = []
 
-        # Step 2: pull the remainder from URL or CSV seeds
         if remaining > 0:
             if url:
-                # Source A: URL flow (existing playlist/profile)
                 raw_from_url = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: scrape_suno_songs(url, limit=AUTOFILL_MAX_PULL)
                 )
@@ -798,41 +865,33 @@ class MusicCog(commands.Cog):
                     random.shuffle(raw_from_url)
                     fallback_raw = raw_from_url[:remaining]
             else:
-                # Source B: CSV flow
                 seed = self.autofill_seed_rows.get(gid) or []
                 if seed:
-                    # choose up to the remaining rows, randomized but fair
                     pick = seed[:]
                     random.shuffle(pick)
                     pick = pick[:remaining]
-                    # Convert to minimal items for resolver: [{'url': ...}, ...]
                     fallback_raw = [
                         {"url": r["url"], "requested_by_note": r.get("requested_by", "")}
                         for r in pick
                     ]
 
-        # Combine liked seeds with fallback seeds
         combined_raw = liked_raw + fallback_raw
         if not combined_raw:
             return 0
 
-        # Step 3: resolve metadata then shuffle for playback order
-        # Filter out obviously invalid URLs before resolving
         cleaned_raw = []
         for it in combined_raw:
             u = str(it.get("url") or it.get("suno_url") or "").strip()
             if not u:
                 continue
             if not (u.startswith("http://") or u.startswith("https://") or u.startswith("songs/")):
-                # skip header strings like "Song URL" or other non-URL cells
                 continue
-            it["url"] = u  # normalize in place
+            it["url"] = u
             cleaned_raw.append(it)
 
         if not cleaned_raw:
             return 0
 
-        # Step 3: resolve metadata then shuffle for playback order
         tracks = await self._resolve_tracks(cleaned_raw, max_workers=6)
         random.shuffle(tracks)
 
@@ -841,25 +900,20 @@ class MusicCog(commands.Cog):
             t["_autofill"] = True
             t.setdefault("tags", []).append("filler")
 
-            # Keep public requester as "Autofill"
             t["requester_id"] = self.bot.user.id if self.bot.user else None
             t["requester_tag"] = "Autofill"
             t["requester_name"] = "Autofill"
             t["requester_mention"] = None
             t["requested_at"] = now_ts
 
-            # Preserve non-visible CSV note (if present)
-            # (We don't expose this anywhere yet, just keeping it available)
             self.queues[gid].append(t)
 
         save_data(gid, self.queues, self.playlists, self.user_mappings)
         return len(tracks)
 
     async def _autofill_after_delay(self, ctx, gid: int, delay: int):
-        """Wait, then seed queue from autofill and kick playback if still idle."""
         try:
             await asyncio.sleep(max(0, delay))
-            # If anything got queued in the meantime, bail.
             if self.queues[gid] or self.current_song:
                 return
             if not self._is_autofill_enabled(gid):
@@ -874,12 +928,10 @@ class MusicCog(commands.Cog):
         except Exception as e:
             print(f"[autofill] failed: {e}")
         finally:
-            # Clear the handle so we can schedule again later
             self.auto_play_tasks[gid] = None
 
     def _schedule_autofill_if_idle(self, ctx, delay: int | None = None):
         gid = ctx.guild.id
-        # Don’t double schedule
         if self.auto_play_tasks.get(gid):
             return
         if not self._is_autofill_enabled(gid):
@@ -899,17 +951,12 @@ class MusicCog(commands.Cog):
     def _per_user_max(self, gid: int) -> int:
         return int(self.queue_per_user_max.get(gid, QUEUE_MAX_PER_USER))
 
-    def _enforce_queue_add_limit(self, gid: int, intended_count: int) -> tuple[int, str | None]:
-        """
-        Returns (allowed_count, notice_message|None).
-        If allowed_count == 0, caller should block and show the message.
-        """
-        if not self._limit_is_on(gid):
+    def _enforce_queue_add_limit(self, gid: int, intended_count: int, *, bypass: bool = False) -> tuple[int, str | None]:
+        if bypass or (not self._limit_is_on(gid)):
             return intended_count, None
         cap = self._limit_max(gid)
         if intended_count <= cap:
             return intended_count, None
-        # Nice message (exact phrasing when cap == 3)
         if cap == 3:
             msg = "You can only enter 3 songs at a time into the queue."
         else:
@@ -929,12 +976,10 @@ class MusicCog(commands.Cog):
         return ctx.channel
 
     def format_time(self, seconds):
-        """Format seconds into MM:SS."""
         mins, secs = divmod(int(seconds), 60)
         return f"{mins:02d}:{secs:02d}"
 
     async def _resolve_tracks(self, items: list[dict], max_workers: int = 6) -> list[dict]:
-        """Given items with 'url' (Suno page), populate full metadata via extract_song_info."""
         loop = asyncio.get_event_loop()
 
         def _resolve_one(item: dict) -> dict:
@@ -955,7 +1000,6 @@ class MusicCog(commands.Cog):
             return await asyncio.gather(*futures)
 
     async def set_song_activity(self, song, elapsed_seconds):
-        """Set the bot's Discord activity during playback."""
         try:
             title = song.get('title', 'Unknown Song')
             duration = song.get('duration', 0) or 0
@@ -972,7 +1016,6 @@ class MusicCog(commands.Cog):
             print(f"Error setting song activity: {e}")
 
     async def _fade_in_volume(self, transformer, target, duration, steps):
-        """Smoothly ramp volume from ~0 to target over duration seconds."""
         try:
             if duration <= 0 or transformer is None:
                 if transformer is not None:
@@ -987,7 +1030,6 @@ class MusicCog(commands.Cog):
                 await asyncio.sleep(delay)
                 transformer.volume = max(0.0, initial + delta * (i + 1))
         except Exception:
-            # If anything goes wrong, just snap to target
             try:
                 transformer.volume = target
             except Exception:
@@ -995,13 +1037,11 @@ class MusicCog(commands.Cog):
 
     @tasks.loop(seconds=30)
     async def update_song_activity(self):
-        """Background task to update song activity every 30 seconds."""
         if self.current_song and self.song_start_time:
             elapsed = time.time() - self.song_start_time
             await self.set_song_activity(self.current_song, elapsed)
 
     async def cog_load(self):
-        # Restore persisted state for each guild
         for guild in self.bot.guilds:
             loaded_queues, loaded_playlists, loaded_user_mappings = load_data(guild.id)
             if guild.id in loaded_queues:
@@ -1011,24 +1051,21 @@ class MusicCog(commands.Cog):
             if guild.id in loaded_user_mappings:
                 self.user_mappings[guild.id] = loaded_user_mappings[guild.id]
 
-            # --- restore autofill settings from user_mappings ---------------
             gid = guild.id
             amap = self.user_mappings[gid]
             ainfo = amap.get("autofill") if isinstance(amap, dict) else None
 
-            enabled_default = True  # autofill ON by default
+            enabled_default = True
 
             if isinstance(ainfo, dict):
                 url = (ainfo.get("url") or "").strip()
                 enabled = bool(ainfo.get("enabled", enabled_default))
-                # NEW: support persisted CSV field (optional)
                 csv_path = (ainfo.get("csv") or "").strip() if isinstance(ainfo, dict) else ""
 
                 if url:
                     self.auto_playlist_urls[gid] = url
                 self.auto_play_enabled[gid] = enabled
 
-                # If no URL but CSV saved, load it
                 if not url and csv_path:
                     self.autofill_seed_rows[gid] = self._load_autofill_csv(csv_path)
             else:
@@ -1037,11 +1074,9 @@ class MusicCog(commands.Cog):
                     self.user_mappings[gid] = amap
                 self.auto_play_enabled[gid] = enabled_default
 
-            # If nothing saved, prefer DEFAULT_AUTOFILL_URL, else DEFAULT_AUTOFILL_CSV
             if not self.auto_playlist_urls.get(gid):
                 if DEFAULT_AUTOFILL_URL:
                     self.auto_playlist_urls[gid] = DEFAULT_AUTOFILL_URL
-                    # persist URL choice
                     amap = self.user_mappings[gid]
                     amap["autofill"] = {
                         "url": DEFAULT_AUTOFILL_URL,
@@ -1052,7 +1087,6 @@ class MusicCog(commands.Cog):
                     rows = self._load_autofill_csv(DEFAULT_AUTOFILL_CSV)
                     if rows:
                         self.autofill_seed_rows[gid] = rows
-                        # persist CSV choice
                         amap = self.user_mappings[gid]
                         amap["autofill"] = {
                             "csv": DEFAULT_AUTOFILL_CSV,
@@ -1061,7 +1095,6 @@ class MusicCog(commands.Cog):
                         save_data(gid, self.queues, self.playlists, self.user_mappings)
 
     async def cog_unload(self):
-        """Clean up resources when the cog is unloaded/reloaded."""
         if self.update_song_activity.is_running():
             self.update_song_activity.cancel()
         try:
@@ -1100,10 +1133,18 @@ class MusicCog(commands.Cog):
                 await ctx.voice_client.move_to(channel)
             else:
                 await channel.connect()
+
+            # ✅ bump Opus bitrate a bit for cleaner highs
+            try:
+                vc = ctx.voice_client
+                if vc and getattr(vc, "encoder", None):
+                    vc.encoder.bitrate = VOICE_BITRATE_KBPS * 1000  # discord expects bps
+            except Exception as e:
+                print(f"[bitrate] couldn't set encoder bitrate: {e}")
+
             embed = discord.Embed(title="✅ Joined", description=f"Joined {channel.name} 🎧", color=0x00ff00)
             await ctx.send(embed=embed)
 
-            # NEW: if idle and autofill is configured+enabled, schedule it immediately
             gid = ctx.guild.id
             if not self.queues[gid] and not (ctx.voice_client and ctx.voice_client.is_playing()):
                 self._cancel_autofill_task(gid)
@@ -1128,7 +1169,6 @@ class MusicCog(commands.Cog):
         self._cancel_autofill_task(gid)
         self._clear_autofill_from_queue(gid)
 
-        # Clear activity
         self.current_song = None
         self.song_start_time = None
         if self.update_song_activity.is_running():
@@ -1138,6 +1178,7 @@ class MusicCog(commands.Cog):
         await ctx.send(embed=embed)
 
     @commands.command(name='play')
+    @app_commands.describe(channel='Play a song using !play [url]')
     async def play(self, ctx, url: str = ""):
         """
         Plays a song by url (Suno url supported only) or scrapes recent if blank.
@@ -1148,18 +1189,18 @@ class MusicCog(commands.Cog):
         guild_id = ctx.guild.id
         queue = self.queues[guild_id]
 
-        # User activity cancels any pending or queued autofill
         self._cancel_autofill_task(guild_id)
         self._clear_autofill_from_queue(guild_id)
 
-        # Capture requester
         requester_id = ctx.author.id
         requester_tag = str(ctx.author)
         requester_name = ctx.author.display_name
         requester_mention = ctx.author.mention
         requested_at = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-        # Per-user cap enforcement
         remaining_user_slots = self._user_slots_remaining(guild_id, requester_id)
+        is_admin = self._is_admin(ctx.author)
+        if is_admin:
+            remaining_user_slots = 10**9  # effectively unlimited
 
         try:
             if not url.strip():
@@ -1172,13 +1213,11 @@ class MusicCog(commands.Cog):
                     await ctx.send(embed=embed)
                     return
 
-                # enforce queue add limit (bulk)
                 intended = len(raw_tracks)
+                allowed_by_add, notice = self._enforce_queue_add_limit(
+                    guild_id, intended, bypass=is_admin
+                )
 
-                # existing per-add throttle
-                allowed_by_add, notice = self._enforce_queue_add_limit(guild_id, intended)
-
-                # NEW: per-user remaining slots
                 if remaining_user_slots <= 0:
                     await ctx.send(embed=self._deny_user_cap_embed(requester_mention, gid=guild_id))
                     return
@@ -1217,18 +1256,15 @@ class MusicCog(commands.Cog):
                 )
                 await ctx.send(embed=embed)
             else:
-                # Single song path
                 song = extract_song_info(url)
-                song.setdefault("artist", song.pop("author", None))  # back-compat
+                song.setdefault("artist", song.pop("author", None))
 
-                # requester fields
                 song["requester_id"] = requester_id
                 song["requester_tag"] = requester_tag
                 song["requester_name"] = requester_name
                 song["requester_mention"] = requester_mention
                 song["requested_at"] = requested_at
 
-                # Single song path
                 if remaining_user_slots <= 0:
                     await ctx.send(embed=self._deny_user_cap_embed(requester_mention))
                     return
@@ -1272,7 +1308,6 @@ class MusicCog(commands.Cog):
         current_idx = self._song_index.get(gid, 0)
         keep = []
         for e in entries:
-            # Only prune NP cards that came from autofill tracks
             if e.get("is_autofill") and (current_idx - e.get("song_index", current_idx)) >= self._np_retention_n:
                 try:
                     ch = self.bot.get_channel(e["channel_id"])
@@ -1280,218 +1315,241 @@ class MusicCog(commands.Cog):
                         msg = await ch.fetch_message(e["message_id"])
                         await msg.delete()
                 except Exception:
-                    # message may already be gone or permissions missing; ignore
                     pass
             else:
                 keep.append(e)
         self._np_track[gid] = keep
 
     async def play_next(self, ctx):
-        guild_id = ctx.guild.id
-        queue = self.queues[guild_id]
-        if not queue:
-            return
-        if not ctx.voice_client:
-            embed = discord.Embed(title="❌ Connection Lost", description="Bot lost voice connection!", color=0xff0000)
-            channel = self.get_radio_channel(ctx)
-            await channel.send(embed=embed)
-            self.current_song = None
-            self.song_start_time = None
-            if self.update_song_activity.is_running():
-                self.update_song_activity.stop()
-            await self.bot.change_presence(activity=None)
-            return
+        gid = ctx.guild.id
+        lock = self._play_locks[gid]
 
-        channel = self.get_radio_channel(ctx)
-        song = queue.popleft()
-
-        # === DB upsert + play_start ===============================================
-        track_id = _canonical_track_id(song)
-        if track_id:
-            try:
-                upsert_track_basic(
-                    track_id=track_id,
-                    title=song.get("title"),
-                    artist=song.get("artist") or song.get("author"),
-                    cover_url=song.get("thumbnail") or song.get("thumb") or song.get("image"),
-                    source_url=_derive_suno_url(song),
-                    duration_sec=_duration_to_seconds(song.get("duration")),
-                )
-                play_id = log_play_start(
-                    track_id=track_id,
-                    guild_id=ctx.guild.id,
-                    channel_id=ctx.channel.id,
-                    requested_by=str(song.get("requester_id") or getattr(ctx.author, "id", "")),
-                    context="autofill" if song.get("_autofill") else "queue",
-                )
-                song["_track_id"] = track_id
-                song["_play_id"] = play_id
-            except Exception as e:
-                print(f"[history] start log failed: {e}")
-        else:
-            song["_track_id"] = None
-            song["_play_id"] = None
-        # ========================================================================
-
-        # ---- PREFETCH handling ---------------------------------------------
-        local_to_delete = None  # ensure defined for after_playing
-        try:
-            lp = await maybe_prefetch(song)
-            if lp and PREFETCH_MODE == "full":
-                local_to_delete = lp
-        except Exception as e:
-            print(f"Prefetch failed for {song.get('url')}: {e}")
-        # --------------------------------------------------------------------
-
-        # FFmpeg options - improve detection for streams (env-tunable)
-        af_filter = f"aresample=async=1:min_hard_comp=0.10:first_pts=0,adelay={STARTUP_ADELAY_MS}|{STARTUP_ADELAY_MS}"
-        base_opts = f"-vn -probesize {FFMPEG_PROBESIZE} -analyzeduration {FFMPEG_ANALYZEDURATION} -af {af_filter}"
-        if str(song.get('url', '')).startswith(('http://', 'https://')):
-            ffmpeg_options = {
-                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +nobuffer -nostdin',
-                'options': base_opts
-            }
-        else:
-            ffmpeg_options = {
-                'options': base_opts
-            }
-        try:
-            source = discord.FFmpegPCMAudio(song['url'], **ffmpeg_options)
-            volume_transformer = discord.PCMVolumeTransformer(source, volume=self.volumes[guild_id])
-        except Exception as e:
-            print(f"Audio source error: {e} for {song.get('url')}")
-            embed = discord.Embed(
-                title="❌ Playback Error",
-                description=f"Failed to play {song.get('title','Unknown')}: {str(e)}",
-                color=0xff0000
-            )
-            try:
-                await ctx.send(embed=embed)
-            except Exception:
-                pass
-            if queue:
-                asyncio.run_coroutine_threadsafe(self.play_next(ctx), self.bot.loop)
-            return
-
-        def after_playing(error):
-            try:
-                if error:
-                    print(f"Player error: {error}")
-
-                try:
-                    if song.get("_track_id") and song.get("_play_id"):
-                        log_play_end(track_id=song["_track_id"], play_id=song["_play_id"])
-                except Exception as e_end:
-                    print(f"[history] end log failed: {e_end}")
-
-                if local_to_delete:
-                    try:
-                        if os.path.exists(local_to_delete):
-                            os.remove(local_to_delete)
-                    except Exception as _e:
-                        print(f"Prefetch cleanup failed: {local_to_delete}: {_e}")
-
+        async with lock:
+            queue = self.queues[gid]
+            if not queue:
+                return
+            if not ctx.voice_client:
+                embed = discord.Embed(title="❌ Connection Lost", description="Bot lost voice connection!", color=0xff0000)
+                channel = self.get_radio_channel(ctx)
+                await channel.send(embed=embed)
                 self.current_song = None
                 self.song_start_time = None
                 if self.update_song_activity.is_running():
                     self.update_song_activity.stop()
-                asyncio.run_coroutine_threadsafe(self.bot.change_presence(activity=None), self.bot.loop)
+                await self.bot.change_presence(activity=None)
+                return
 
-                if queue and ctx.voice_client:
-                    asyncio.run_coroutine_threadsafe(self.play_next(ctx), self.bot.loop)
-                elif not queue:
-                    embed2 = discord.Embed(title="⏹️ Queue Empty", description="Finished playing! 🎉", color=0x00ff00)
-                    asyncio.run_coroutine_threadsafe(self.get_radio_channel(ctx).send(embed=embed2), self.bot.loop)
-                    # schedule idle radio (autofill) if configured — thread-safe trigger
-                    try:
-                        self.bot.loop.call_soon_threadsafe(lambda: self._schedule_autofill_if_idle(ctx))
-                    except Exception as _e:
-                        print(f"[autofill schedule] {_e}")
-            except Exception as e2:
-                print(f"after_playing crashed: {e2}")
+            channel = self.get_radio_channel(ctx)
+            song = queue.popleft()
 
-        # Optional pre-buffer to avoid initial cut (fill FFmpeg/voice buffers)
-        try:
-            if PREBUFFER_SECONDS > 0:
-                await asyncio.sleep(PREBUFFER_SECONDS)
-        except Exception:
-            pass
+            track_id = _canonical_track_id(song)
+            if track_id:
+                try:
+                    upsert_track_basic(
+                        track_id=track_id,
+                        title=song.get("title"),
+                        artist=song.get("artist") or song.get("author"),
+                        cover_url=song.get("thumbnail") or song.get("thumb") or song.get("image"),
+                        source_url=_derive_suno_url(song),
+                        duration_sec=_duration_to_seconds(song.get("duration")),
+                    )
+                    play_id = log_play_start(
+                        track_id=track_id,
+                        guild_id=ctx.guild.id,
+                        channel_id=ctx.channel.id,
+                        requested_by=str(song.get("requester_id") or getattr(ctx.author, "id", "")),
+                        context="autofill" if song.get("_autofill") else "queue",
+                    )
+                    song["_track_id"] = track_id
+                    song["_play_id"] = play_id
+                except Exception as e:
+                    print(f"[history] start log failed: {e}")
+            else:
+                song["_track_id"] = None
+                song["_play_id"] = None
 
-        # If fade-in is enabled, start low and ramp after play()
-        target_vol = self.volumes[guild_id]
-        if FADE_IN_SECONDS > 0:
+            local_to_delete = None
             try:
-                volume_transformer.volume = 0.0001
+                lp = await maybe_prefetch(song)
+                if lp and PREFETCH_MODE == "full":
+                    local_to_delete = lp
+            except Exception as e:
+                print(f"Prefetch failed for {song.get('url')}: {e}")
+
+            # ---- FFmpeg options (latency + stability tuned) ------------------
+            af_filter = (
+                "aresample=async=1:min_hard_comp=0.10:first_pts=0,"
+                f"adelay={STARTUP_ADELAY_MS}|{STARTUP_ADELAY_MS}"
+            )
+            base_opts = (
+                f"-vn "
+                f"-probesize {FFMPEG_PROBESIZE} "
+                f"-analyzeduration {FFMPEG_ANALYZEDURATION} "
+                f"-thread_queue_size {FFMPEG_THREAD_QUEUE_SIZE} "
+                f"-buffer_size {FFMPEG_BUFFER_SIZE} "
+                f"-max_delay {FFMPEG_MAX_DELAY_US} "
+                f"-af {af_filter}"
+            )
+            if FFMPEG_NOBUFFER:
+                base_opts += " -fflags +nobuffer"
+
+            url_val = str(song.get("url", "")).strip()
+            is_http = url_val.startswith(("http://", "https://"))
+
+            if is_http:
+                before_opts = (
+                    "-reconnect 1 "
+                    "-reconnect_streamed 1 "
+                    "-reconnect_at_eof 1 "
+                    "-reconnect_delay_max 5 "
+                    f"-rw_timeout {FFMPEG_RW_TIMEOUT_US} "
+                    "-nostdin"
+                )
+                ffmpeg_options = {
+                    "before_options": before_opts,
+                    "options": base_opts,
+                }
+            else:
+                ffmpeg_options = {
+                    "options": base_opts,
+                }
+
+            try:
+                source = discord.FFmpegPCMAudio(url_val, **ffmpeg_options)
+                volume_transformer = discord.PCMVolumeTransformer(source, volume=self.volumes[gid])
+            except Exception as e:
+                print(f"Audio source error: {e} for {song.get('url')}")
+                embed = discord.Embed(
+                    title="❌ Playback Error",
+                    description=f"Failed to play {song.get('title','Unknown')}: {str(e)}",
+                    color=0xff0000
+                )
+                try:
+                    await ctx.send(embed=embed)
+                except Exception:
+                    pass
+                if queue and ctx.voice_client:
+                    self.bot.loop.create_task(self.play_next(ctx))
+                return
+
+            def after_playing(error):
+                try:
+                    if error:
+                        print(f"Player error: {error}")
+
+                    try:
+                        if song.get("_track_id") and song.get("_play_id"):
+                            log_play_end(track_id=song["_track_id"], play_id=song["_play_id"])
+                    except Exception as e_end:
+                        print(f"[history] end log failed: {e_end}")
+
+                    if local_to_delete:
+                        try:
+                            if os.path.exists(local_to_delete):
+                                os.remove(local_to_delete)
+                        except Exception as _e:
+                            print(f"Prefetch cleanup failed: {local_to_delete}: {_e}")
+
+                    self.current_song = None
+                    self.song_start_time = None
+                    if self.update_song_activity.is_running():
+                        self.update_song_activity.stop()
+                    asyncio.run_coroutine_threadsafe(self.bot.change_presence(activity=None), self.bot.loop)
+
+                    if queue and ctx.voice_client:
+                        self.bot.loop.call_soon_threadsafe(lambda: self.bot.loop.create_task(self.play_next(ctx)))
+                    elif not queue:
+                        embed2 = discord.Embed(title="⏹️ Queue Empty", description="Finished playing! 🎉", color=0x00ff00)
+                        asyncio.run_coroutine_threadsafe(self.get_radio_channel(ctx).send(embed=embed2), self.bot.loop)
+                        try:
+                            self.bot.loop.call_soon_threadsafe(lambda: self._schedule_autofill_if_idle(ctx))
+                        except Exception as _e:
+                            print(f"[autofill schedule] {_e}")
+                except Exception as e2:
+                    print(f"after_playing crashed: {e2}")
+
+            target_vol = self.volumes[gid]
+            start_muted = (PREBUFFER_SECONDS > 0) or (FADE_IN_SECONDS > 0)
+            if start_muted:
+                try:
+                    volume_transformer.volume = 0.0001
+                except Exception:
+                    pass
+
+            ctx.voice_client.play(volume_transformer, after=after_playing)
+
+            if PREBUFFER_SECONDS > 0:
+                try:
+                    await asyncio.sleep(PREBUFFER_SECONDS)
+                except Exception:
+                    pass
+
+            if FADE_IN_SECONDS > 0:
+                asyncio.create_task(
+                    self._fade_in_volume(
+                        volume_transformer,
+                        target_vol,
+                        FADE_IN_SECONDS,
+                        FADE_IN_STEPS
+                    )
+                )
+            else:
+                try:
+                    volume_transformer.volume = target_vol
+                except Exception:
+                    pass
+
+            self._song_index[gid] += 1
+            current_song_index = self._song_index[gid]
+
+            if self.update_song_activity.is_running():
+                self.update_song_activity.stop()
+            self.current_song = song
+            self.song_start_time = time.time()
+            await self.set_song_activity(song, 0.0)
+            if not self.update_song_activity.is_running():
+                self.update_song_activity.start()
+
+            requester = (song.get("requester_mention")
+                         or song.get("requester_name")
+                         or song.get("requester_tag"))
+            upcoming_two = list(self.queues[gid])[:2]
+            np_embed = build_now_playing_embed(song, requester_mention=requester, upcoming_tracks=upcoming_two)
+
+            song_url = _derive_suno_url(song) or (song.get("url") or "")
+            song_title = song.get("title") or song.get("track_id") or "Untitled"
+
+            view = None
+            if song.get("_track_id"):
+                view = LikeView(
+                    track_id=song["_track_id"],
+                    guild_id=ctx.guild.id,
+                    bot_user_id=(self.bot.user.id if self.bot.user else 0),
+                    song_title=song_title,
+                    song_url=song_url,
+                )
+
+            ch = self.get_radio_channel(ctx)
+            sent_message = await ch.send(embed=np_embed, view=view)
+
+            try:
+                if sent_message:
+                    entry = {
+                        "message_id": sent_message.id,
+                        "channel_id": sent_message.channel.id,
+                        "song_index": current_song_index,
+                        "is_autofill": bool(song.get("_autofill")),
+                    }
+                    self._np_track[gid].append(entry)
             except Exception:
                 pass
 
-        ctx.voice_client.play(volume_transformer, after=after_playing)
-
-        # Launch fade-in task (non-blocking) if enabled
-        if FADE_IN_SECONDS > 0:
-            asyncio.create_task(self._fade_in_volume(volume_transformer, target_vol, FADE_IN_SECONDS, FADE_IN_STEPS))
-
-        # === Always run from here, regardless of fade-in ===
-        # Increment song index (counts every song start)
-        self._song_index[guild_id] += 1
-        current_song_index = self._song_index[guild_id]
-
-        # Set bot activity
-        if self.update_song_activity.is_running():
-            self.update_song_activity.stop()
-        self.current_song = song
-        self.song_start_time = time.time()
-        await self.set_song_activity(song, 0.0)
-        if not self.update_song_activity.is_running():
-            self.update_song_activity.start()
-
-        # NOW PLAYING card
-        requester = (song.get("requester_mention")
-                     or song.get("requester_name")
-                     or song.get("requester_tag"))
-        upcoming_two = list(self.queues[guild_id])[:2]
-        np_embed = build_now_playing_embed(song, requester_mention=requester, upcoming_tracks=upcoming_two)
-
-        sent_message = None
-        view = None
-
-        # Build a LikeView only if we have a track_id anchor
-        song_url = _derive_suno_url(song) or (song.get("url") or "")
-        song_title = song.get("title") or song.get("track_id") or "Untitled"
-
-        view = None
-        if song.get("_track_id"):
-            view = LikeView(
-                track_id=song["_track_id"],
-                guild_id=ctx.guild.id,
-                bot_user_id=(self.bot.user.id if self.bot.user else 0),
-                song_title=song_title,
-                song_url=song_url,
-            )
-        # send
-        ch = self.get_radio_channel(ctx)
-        sent_message = await ch.send(embed=np_embed, view=view)
-
-        # Track NP message for autofill pruning
-        try:
-            if sent_message:
-                entry = {
-                    "message_id": sent_message.id,
-                    "channel_id": sent_message.channel.id,
-                    "song_index": current_song_index,
-                    "is_autofill": bool(song.get("_autofill")),
-                }
-                self._np_track[guild_id].append(entry)
-        except Exception:
-            pass
-
-        # Cleanup only autofill NP cards older than retention window
-        await self._cleanup_np_autofill(guild_id)
+            await self._cleanup_np_autofill(gid)
 
     @commands.command(name='queue')
     async def show_queue(self, ctx):
         """
-        Shows the current queue with estimated time to start for each item.
+            Shows the current queue with estimated time to start for each item.
         """
         guild_id = ctx.guild.id
         queue = self.queues[guild_id]
@@ -1504,7 +1562,6 @@ class MusicCog(commands.Cog):
             await ctx.send(embed=embed)
             return
 
-        # Compute ETAs for each queued item (relative to now)
         eta_list = self._queue_eta_list(guild_id)
 
         max_lines = 15
@@ -1549,7 +1606,6 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         target = (target or "").strip().lower()
 
-        # Helper to remove all filler from queue
         def _purge_filler_from_queue() -> int:
             q = self.queues[gid]
             if not q:
@@ -1567,11 +1623,10 @@ class MusicCog(commands.Cog):
                 save_data(gid, self.queues, self.playlists, self.user_mappings)
             return removed
 
-        # Special mode: skip & purge filler
         if target == "autofill":
             removed_current = False
             if self.current_song and self.current_song.get("_autofill") and ctx.voice_client and ctx.voice_client.is_playing():
-                ctx.voice_client.stop()
+                await self._fade_out_and_stop(ctx)
                 removed_current = True
 
             removed_queued = _purge_filler_from_queue()
@@ -1591,9 +1646,8 @@ class MusicCog(commands.Cog):
             ))
             return
 
-        # Default behavior: skip whatever is playing
         if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
+            await self._fade_out_and_stop(ctx)
             await ctx.send(embed=discord.Embed(
                 title="⏭️ Skipped",
                 description="Skipped the current track! 🚀",
@@ -1606,7 +1660,7 @@ class MusicCog(commands.Cog):
         Stops all playback and clears the playlist queue
         """
         if ctx.voice_client:
-            ctx.voice_client.stop()
+            await self._fade_out_and_stop(ctx)
 
         gid = ctx.guild.id
         self.queues[gid].clear()
@@ -1614,7 +1668,6 @@ class MusicCog(commands.Cog):
         if CLEAR_PLAYLISTS_ON_STOP:
             self.playlists[gid].clear()
 
-        # Cancel any pending autofill task and remove filler already queued
         self._cancel_autofill_task(gid)
         self._clear_autofill_from_queue(gid)
 
@@ -1632,12 +1685,21 @@ class MusicCog(commands.Cog):
         embed = discord.Embed(title="⏹️ Stopped", description=msg, color=0xff0000)
         await ctx.send(embed=embed)
 
-        # Start idle-radio (autofill) after a stop, if feature is enabled and a source exists
         try:
             if self._is_autofill_enabled(gid):
                 self._schedule_autofill_if_idle(ctx, delay=AUTOFILL_DELAY_SEC)
         except Exception as _e:
             print(f"[autofill after stop] {_e}")
+
+    @commands.command(name="stahp", hidden=True)
+    async def stahp(self, ctx):
+        """STAHP"""
+        await self.stop(ctx)
+
+    @commands.command(name="hush", hidden=True)
+    async def hush(self, ctx):
+        """Shh"""
+        await self.stop(ctx)
 
     @commands.command(name='shuffle')
     async def shuffle_queue(self, ctx):
@@ -1676,24 +1738,23 @@ class MusicCog(commands.Cog):
                 ctx.voice_client.source.volume = self.volumes[guild_id]
 
     @commands.command(name='playlist')
-    @commands.has_permissions(administrator=False)
     async def playlist(self, ctx, url: str, max_items: int = 100):
         """
         Enqueue tracks from a Suno playlist/profile/handle in bulk
         Usage: !playlist https://suno.com/playlist/##"
         """
+        is_admin = self._is_admin(ctx.author)
+
         if not ctx.voice_client:
             await ctx.invoke(self.join)
 
         guild_id = ctx.guild.id
         queue = self.queues[guild_id]
 
-        # User playlist enqueue cancels any pending/queued autofill
         self._cancel_autofill_task(guild_id)
         self._clear_autofill_from_queue(guild_id)
 
         try:
-            # run sync scraper in a thread
             loop = asyncio.get_event_loop()
             raw_tracks = await loop.run_in_executor(
                 None, lambda: scrape_suno_songs(url, limit=max_items)
@@ -1707,9 +1768,11 @@ class MusicCog(commands.Cog):
                 await ctx.send(embed=embed)
                 return
 
-            # enforce queue add limit (bulk)
             intended = len(raw_tracks)
-            allowed, notice = self._enforce_queue_add_limit(guild_id, intended)
+            allowed, notice = self._enforce_queue_add_limit(
+                guild_id, intended, bypass=is_admin
+            )
+
             if allowed <= 0:
                 await ctx.send(embed=discord.Embed(
                     title="🚫 Queue Limit",
@@ -1722,13 +1785,17 @@ class MusicCog(commands.Cog):
 
             tracks = await self._resolve_tracks(raw_tracks, max_workers=6)
 
+            # ✅ define timestamp once
+            now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
             start_pos = len(queue) + 1
             for t in tracks:
                 t["requester_id"] = ctx.author.id
                 t["requester_tag"] = str(ctx.author)
                 t["requester_name"] = ctx.author.display_name
                 t["requester_mention"] = ctx.author.mention
-                t["requested_at"] = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+                t["requested_at"] = now_ts
+                t["_from_playlist"] = True  # optional but nice if you want later filtering
                 queue.append(t)
 
             end_pos = len(queue)
@@ -1794,8 +1861,14 @@ class MusicCog(commands.Cog):
         Reload the song cog activity (Admin Only)
         """
         try:
-            if ctx.voice_client:
-                ctx.voice_client.stop()
+            if ctx.voice_client and ctx.voice_client.is_playing():
+                await self._fade_out_and_stop(ctx)
+            else:
+                try:
+                    if ctx.voice_client:
+                        ctx.voice_client.stop()
+                except Exception:
+                    pass
             self.current_song = None
             self.song_start_time = None
             if self.update_song_activity.is_running():
@@ -1825,7 +1898,6 @@ class MusicCog(commands.Cog):
             embed = discord.Embed(title="❌ Reload Failed", description=f"Error: {str(e)}", color=0xff0000)
             await ctx.send(embed=embed)
 
-    @commands.has_permissions(administrator=False)
     @commands.command(name='queue_clear')
     async def queue_clear(self, ctx):
         """
@@ -1836,16 +1908,43 @@ class MusicCog(commands.Cog):
         save_data(gid, self.queues, self.playlists, self.user_mappings)
         await ctx.send(embed=discord.Embed(title="🧹 Queue Cleared", description="All queued tracks removed.", color=0x00ff00))
 
-    @commands.has_permissions(administrator=False)
     @commands.command(name='playlist_clear')
     async def playlist_clear(self, ctx):
         """
         Clears the song queue of playlists (experimental)
         """
         gid = ctx.guild.id
-        self.playlists[gid].clear()
+        q = self.queues[gid]
+
+        if not q:
+            await ctx.send(embed=discord.Embed(
+                title="🧹 Playlist Tracks Cleared",
+                description="Queue is empty — nothing to clear.",
+                color=0x00ff00
+            ))
+            return
+
+        before = len(q)
+
+        kept = [t for t in q if not t.get("_from_playlist")]
+        removed = before - len(kept)
+
+        q.clear()
+        q.extend(kept)
+
         save_data(gid, self.queues, self.playlists, self.user_mappings)
-        await ctx.send(embed=discord.Embed(title="🗑️ Playlists Cleared", description="All playlists removed.", color=0xff5555))
+
+        desc = (
+            f"Removed **{removed}** playlist-added track(s) from the queue."
+            if removed else
+            "No playlist-added tracks were in the queue."
+        )
+
+        await ctx.send(embed=discord.Embed(
+            title="🧹 Playlist Tracks Cleared",
+            description=desc,
+            color=0x00ff00
+        ))
 
     @commands.has_permissions(administrator=True)
     @commands.command(name='reset_state')
@@ -1856,7 +1955,7 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         self.queues[gid].clear()
         self.playlists[gid].clear()
-        self.user_mappings[gid].clear()  # This will intentionally erase the saved autofill url/flag.
+        self.user_mappings[gid].clear()
         self._cancel_autofill_task(gid)
         self._clear_autofill_from_queue(gid)
         save_data(gid, self.queues, self.playlists, self.user_mappings)
@@ -1876,10 +1975,8 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         the_url = url.strip()
         self.auto_playlist_urls[gid] = the_url
-        # default ON (and persists)
         self.auto_play_enabled[gid] = True
 
-        # persist in user_mappings
         amap = self.user_mappings[gid]
         if not isinstance(amap, dict):
             amap = {}
@@ -1905,7 +2002,6 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         self.auto_play_enabled[gid] = True
 
-        # persist flag
         amap = self.user_mappings[gid]
         if not isinstance(amap, dict):
             amap = {}
@@ -1932,7 +2028,6 @@ class MusicCog(commands.Cog):
         self._cancel_autofill_task(gid)
         self._clear_autofill_from_queue(gid)
 
-        # persist flag
         amap = self.user_mappings[gid]
         if not isinstance(amap, dict):
             amap = {}
@@ -1956,7 +2051,6 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         enabled = bool(self.auto_play_enabled.get(gid, True)) and self._autofill_feature_on
 
-        # Prefer saved URL; else show CSV count if present; else env default; else —
         url = self.auto_playlist_urls.get(gid)
         csv_rows = self.autofill_seed_rows.get(gid)
         if url:
@@ -1975,7 +2069,6 @@ class MusicCog(commands.Cog):
             color=0x7289DA
         ))
 
-    # ========== Autofill CSV: force reload (Admin) ===========================
     @commands.has_permissions(administrator=True)
     @commands.command(name="autofill_reload")
     async def autofill_reload(self, ctx):
@@ -1985,7 +2078,6 @@ class MusicCog(commands.Cog):
         """
         gid = ctx.guild.id
 
-        # --- Resolve the active CSV path (prefer saved source) -------------------
         csv_path = None
         try:
             amap = self.user_mappings.get(gid) or {}
@@ -1995,7 +2087,6 @@ class MusicCog(commands.Cog):
             csv_path = ""
 
         if not csv_path:
-            # fallbacks: explicit env → default env used at boot → legacy attr → plain filename
             csv_path = (
                 os.getenv("AUTOFILL_CSV_PATH", "").strip()
                 or os.getenv("DEFAULT_AUTOFILL_CSV", "").strip()
@@ -2005,7 +2096,6 @@ class MusicCog(commands.Cog):
 
         path = os.path.abspath(os.path.expanduser(csv_path))
 
-        # --- Load rows (simple & robust) ----------------------------------------
         try:
             rows = []
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
@@ -2017,7 +2107,6 @@ class MusicCog(commands.Cog):
                     cell0 = (r[0] or "").strip()
                     cell0_norm = cell0.lower().replace(" ", "")
 
-                    # skip optional header like "url", "song url", "track url", etc.
                     if first_row and cell0_norm in ("url", "songurl", "trackurl"):
                         first_row = False
                         continue
@@ -2043,7 +2132,6 @@ class MusicCog(commands.Cog):
 
         total = len(rows)
 
-        # --- Update caches so other parts see fresh data -------------------------
         self._autofill_csv_cache = rows
         self.autofill_seed_rows[gid] = rows[:]
         try:
@@ -2051,7 +2139,6 @@ class MusicCog(commands.Cog):
         except Exception:
             pass
 
-        # --- File diagnostics to make live debugging easier ----------------------
         try:
             size = os.path.getsize(path)
             mtime = int(os.path.getmtime(path))
@@ -2069,7 +2156,6 @@ class MusicCog(commands.Cog):
             color=0x2ecc71
         ))
 
-    # ========== Autofill: unset URL override (Admin) =========================
     @commands.has_permissions(administrator=True)
     @commands.command(name="autofill_unset")
     async def autofill_unset(self, ctx):
@@ -2079,22 +2165,20 @@ class MusicCog(commands.Cog):
         """
         gid = ctx.guild.id
 
-        # Clear runtime URL
         if gid in self.auto_playlist_urls:
             try:
                 self.auto_playlist_urls.pop(gid, None)
             except Exception:
                 self.auto_playlist_urls[gid] = ""
 
-        # Persist change into user_mappings
         amap = self.user_mappings.get(gid)
         if not isinstance(amap, dict):
             amap = {}
-            self.user_mappings[guild_id] = amap  # safe-guard (should be gid)
+            self.user_mappings[guild_id] = amap
         ainfo = amap.get("autofill", {})
         enabled_state = bool(self.auto_play_enabled.get(gid, ainfo.get("enabled", True)))
         ainfo["enabled"] = enabled_state
-        ainfo["url"] = ""  # blank means "no page override"
+        ainfo["url"] = ""
         amap["autofill"] = ainfo
 
         save_data(gid, self.queues, self.playlists, self.user_mappings)
@@ -2110,7 +2194,6 @@ class MusicCog(commands.Cog):
             color=0x3498db
         ))
 
-    # ========== Queue limit commands (Admin) =================================
     @commands.has_permissions(administrator=True)
     @commands.command(name="queue_limit_on")
     async def queue_limit_on(self, ctx):
@@ -2141,7 +2224,6 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         self.queue_limit_enabled[gid] = False
 
-        # NEW: optionally update per-user cap
         if per_user_max is not None:
             per_user_max = max(1, int(per_user_max))
             self.queue_per_user_max[gid] = per_user_max
@@ -2151,7 +2233,6 @@ class MusicCog(commands.Cog):
             amap = {}
             self.user_mappings[gid] = amap
 
-        # persist both values, including per_user_max
         amap["queue_limit"] = {
             "enabled": False,
             "max": self._limit_max(gid),
@@ -2177,7 +2258,6 @@ class MusicCog(commands.Cog):
         max_per_add = max(1, int(max_per_add))
         self.queue_limit_max[gid] = max_per_add
 
-        # NEW: optional per-user cap update
         if per_user_max is not None:
             per_user_max = max(1, int(per_user_max))
             self.queue_per_user_max[gid] = per_user_max
@@ -2210,7 +2290,7 @@ class MusicCog(commands.Cog):
         gid = ctx.guild.id
         enabled = self._limit_is_on(gid)
         maxn = self._limit_max(gid)
-        per_user_cap = self._per_user_max(gid)  # NEW: from persistence/runtime
+        per_user_cap = self._per_user_max(gid)
         await ctx.send(embed=discord.Embed(
             title="ℹ️ Queue Limit Status",
             description=f"**State:** {'ON' if enabled else 'OFF'}\n"
@@ -2218,6 +2298,65 @@ class MusicCog(commands.Cog):
                         f"**Max per user:** {per_user_cap}",
             color=0x7289DA
         ))
+
+    @commands.has_permissions(administrator=True)
+    @commands.command(name="ping")
+    async def ping(self, ctx):
+        """
+            Shows Server Ping information (Admin only)
+        """
+        gid = ctx.guild.id
+        vc = ctx.voice_client
+
+        # --- Core latency ---
+        ws_ms = round(self.bot.latency * 1000)
+
+        # --- Shard info (safe if not sharded) ---
+        shard_id = getattr(ctx.guild, "shard_id", None)
+        shard_str = f"{shard_id}" if shard_id is not None else "—"
+
+        # --- Voice / playback state ---
+        if vc and vc.channel:
+            voice_state = f"Connected to **{vc.channel.name}**"
+            is_playing = vc.is_playing()
+        else:
+            voice_state = "Not connected"
+            is_playing = False
+
+        current_title = None
+        if self.current_song:
+            current_title = self.current_song.get("title") or "Untitled"
+
+        q_len = len(self.queues.get(gid, []))
+
+        # --- Feature toggles ---
+        autofill_enabled = self._is_autofill_enabled(gid)
+        queue_limit_on = self._limit_is_on(gid)
+        max_per_add = self._limit_max(gid)
+        per_user_cap = self._per_user_max(gid)
+
+        desc_lines = [
+            f"**WebSocket:** `{ws_ms} ms`",
+            f"**Shard:** `{shard_str}`",
+            f"**Voice:** {voice_state}",
+            f"**Playing:** `{'yes' if is_playing else 'no'}`",
+        ]
+
+        if current_title:
+            desc_lines.append(f"**Now playing:** {_truncate(current_title, 80)}")
+
+        desc_lines += [
+            f"**Queue size:** `{q_len}`",
+            f"**Autofill:** `{'on' if autofill_enabled else 'off'}`",
+            f"**Queue limit:** `{'on' if queue_limit_on else 'off'}` (max/add `{max_per_add}`, per-user `{per_user_cap}`)",
+        ]
+
+        embed = discord.Embed(
+            title="🏓 Pong",
+            description="\n".join(desc_lines),
+            color=0x2ecc71
+        )
+        await ctx.send(embed=embed)
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
