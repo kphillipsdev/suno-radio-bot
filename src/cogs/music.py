@@ -19,7 +19,7 @@ from src.utils.yt_extractor import extract_song_info
 from src.utils.scraper import scrape_suno_songs
 from src.utils.prefetch import prefetch_to_file
 from src.data.db import like_track, unlike_track, has_liked, get_like_count, top_liked_for_users
-from shuffle_displacing_first import shuffle_displacing_first_inplace
+from src.utils.shuffle_displacing_first import shuffle_displacing_first_inplace
 
 # === Play history DB (safe if module not present) ===========================
 try:
@@ -1151,7 +1151,7 @@ class MusicCog(commands.Cog):
                 self._cancel_autofill_task(gid)
                 self._schedule_autofill_if_idle(ctx, delay=AUTOFILL_DELAY_SEC)
         except Exception as e:
-            embed = discord.Embed(title="❌ Voice Connection Error", description=f"Failed to join {channel.name}: {str(e)}\nPlease check bot permissions and try again.", color=0xff0000)
+            embed = discord.Embed(title="❌ Voice Connection Error", description=f"Failed to join {channel.name}: {str(e)}.", color=0xff0000)
             await ctx.send(embed=embed)
 
     @commands.hybrid_command(name='leave', description='Leave the current voice channel')
