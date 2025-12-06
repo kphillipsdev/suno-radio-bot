@@ -19,6 +19,7 @@ from src.utils.yt_extractor import extract_song_info
 from src.utils.scraper import scrape_suno_songs
 from src.utils.prefetch import prefetch_to_file
 from src.data.db import like_track, unlike_track, has_liked, get_like_count, top_liked_for_users
+from shuffle_displacing_first import shuffle_displacing_first_inplace
 
 # === Play history DB (safe if module not present) ===========================
 try:
@@ -1713,7 +1714,10 @@ class MusicCog(commands.Cog):
             await ctx.send(embed=embed)
             return
         items = list(queue)
-        random.shuffle(items)
+        
+        # random.shuffle(items) vvv changed by Paul Schirf
+        shuffle_displacing_first_inplace(items)
+
         queue.clear()
         queue.extend(items)
         save_data(guild_id, self.queues, self.playlists, self.user_mappings)
