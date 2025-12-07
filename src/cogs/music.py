@@ -20,6 +20,7 @@ from src.utils.scraper import scrape_suno_songs
 from src.utils.prefetch import prefetch_to_file
 from src.data.db import like_track, unlike_track, has_liked, get_like_count, top_liked_for_users
 from src.utils.shuffle_displacing_first import shuffle_displacing_first_inplace
+from src.ui.queue_manager import QueueManagerView, build_queue_embed
 
 # === Play history DB (safe if module not present) ===========================
 try:
@@ -32,6 +33,9 @@ except Exception:
 # ===== Embed + Formatting Helpers ===========================================
 EMBED_COLOR_PLAYING = 0x580fd6
 EMBED_COLOR_ADDED   = 0xc1d4d6
+
+# Commands whose *text* messages should be auto-deleted after successful run
+AUTO_DELETE_COMMANDS: set[str] = {"play", "skip", "stop", "top", "history", "queue", "remove", "join" ,"leave"}
 
 # ---- Prefetch config (env-driven) ------------------------------------------
 PREFETCH_MODE    = os.getenv("PREFETCH_MODE", "full").lower()  # "none" | "warmup" | "full"
@@ -484,7 +488,7 @@ class LikeView(discord.ui.View):
                 pass
 
 # ===== Music Cog =============================================================
-class MusicCog(commands.Cog):
+class RadioBot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.queues = defaultdict(deque)
@@ -2362,5 +2366,78 @@ class MusicCog(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    @commands.has_permissions(administrator=True)
+    @commands.command(
+        name="qpanel",
+        help="Open an interactive queue management panel (admins only).",
+        hidden=True,
+    )
+    async def qpanel(self, ctx: commands.Context) -> None:
+        """Open the queue manager panel for this guild."""
+        if not ctx.guild:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        guild_id = ctx.guild.id
+        queue = self.queues.get(guild_id)
+
+        if not queue or len(queue) == 0:
+            await ctx.send("The queue is currently empty.")
+            return
+
+        view = QueueManagerView(
+            guild=ctx.guild,
+            queue=queue,          # this is your live deque
+            invoker=ctx.author,
+        )
+        embed = build_queue_embed(ctx.guild, queue)
+        msg = await ctx.send(embed=embed, view=view)
+        view.message = msg
+
+    @commands.Cog.listener()
+    async def on_command_completion(self, ctx: commands.Context) -> None:
+        """
+        Auto-delete certain prefix command messages (e.g. !play, !skip)
+        after they successfully complete.
+
+        - Only runs for prefix commands (not slash commands).
+        - Only affects commands on this cog.
+        - Only deletes if the bot has Manage Messages in that channel.
+        """
+        # Safety: sometimes this event can fire with non-Context or no command
+        if not isinstance(ctx, commands.Context):
+            return
+        if ctx.command is None:
+            return
+
+        # Only care about commands on this cog
+        if ctx.cog is not self:
+            return
+
+        # Only delete selected commands (play, skip, etc.)
+        cmd_name = ctx.command.name
+        if cmd_name not in AUTO_DELETE_COMMANDS:
+            return
+
+        # Grab the original message (prefix command)
+        msg = getattr(ctx, "message", None)
+        if not msg or not msg.guild:
+            return
+
+        # Ensure we actually have perms to delete
+        me = msg.guild.me
+        if me is None:
+            return
+
+        perms = msg.channel.permissions_for(me)
+        if not perms.manage_messages:
+            return
+
+        try:
+            await msg.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            # Silently ignore if we can't delete for some reason
+            return
+
 async def setup(bot):
-    await bot.add_cog(MusicCog(bot))
+    await bot.add_cog(RadioBot(bot))
