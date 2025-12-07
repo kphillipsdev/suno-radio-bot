@@ -78,7 +78,7 @@ class MusicHelpCommand(commands.HelpCommand):
             await self.send_admin_help()
             return
 
-        # Default behaviour: !help, !help foo, !help MusicCog, etc.
+        # Default behaviour: !help, !help foo, !help RadioBot, etc.
         return await super().command_callback(ctx, command=command)
 
     def _fmt_sig(self, command: commands.Command) -> str:
