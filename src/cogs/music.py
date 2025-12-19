@@ -35,7 +35,7 @@ EMBED_COLOR_PLAYING = 0x580fd6
 EMBED_COLOR_ADDED   = 0xc1d4d6
 
 # Commands whose *text* messages should be auto-deleted after successful run
-AUTO_DELETE_COMMANDS: set[str] = {"play", "skip", "stop", "top", "history", "queue", "remove", "join" ,"leave"}
+AUTO_DELETE_COMMANDS: set[str] = {"skip", "stop", "top", "history", "queue", "remove", "join" ,"leave"}
 
 # ---- Prefetch config (env-driven) ------------------------------------------
 PREFETCH_MODE    = os.getenv("PREFETCH_MODE", "full").lower()  # "none" | "warmup" | "full"
@@ -70,6 +70,10 @@ AUTOFILL_MAX_PULL  = int(os.getenv("AUTOFILL_MAX_PULL", "50"))    # how many to 
 DEFAULT_AUTOFILL_URL = os.getenv("DEFAULT_AUTOFILL_URL", "").strip()
 DEFAULT_AUTOFILL_CSV = os.getenv("DEFAULT_AUTOFILL_CSV", "").strip()
 AUTOFILL_LIKES_PER_USER = int(os.getenv("AUTOFILL_LIKES_PER_USER", "5"))
+
+# ---- Requester VC check ---------------------------------------------------
+SKIP_IF_REQUESTER_LEFT = os.getenv("SKIP_IF_REQUESTER_LEFT", "1") == "1"
+SHOW_SKIP_MESSAGE = os.getenv("SHOW_SKIP_MESSAGE", "1") == "1"
 
 # ---- Queue add limit (peak throttle) ---------------------------------------
 QUEUE_LIMIT_DEFAULT_ENABLED = os.getenv("QUEUE_LIMIT_DEFAULT_ENABLED", "1") == "1"
@@ -442,14 +446,14 @@ class LikeView(discord.ui.View):
             self.like_btn.emoji = LIKE_FALLBACK
 
         # Default: hide the count
-        self.like_btn.label = "Like"
+        self.like_btn.label = "Save for Autofill"
         # For testing, show the count at init:
         # if self.show_count:
         #     self.like_btn.label = str(count)
 
     @discord.ui.button(
         style=discord.ButtonStyle.primary,
-        label="Like",
+        label="Save for Autofill",
         custom_id="suno_like_btn"
     )
     async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -463,14 +467,14 @@ class LikeView(discord.ui.View):
                 )
                 msg = f"Removed your like for **{self.song_title}**."
                 button.style = discord.ButtonStyle.primary
-                button.label = str(total) if self.show_count else "Like"
+                button.label = str(total) if self.show_count else "Save for Autofill"
             else:
                 total = like_track(
                     track_id=self.track_id, guild_id=self.guild_id, user_id=interaction.user.id,
                     username=str(interaction.user),
                 )
                 msg = f"Thanks for liking **{self.song_title}**!"
-                button.label = str(total) if self.show_count else "Like"
+                button.label = str(total) if self.show_count else "Save for Autofill"
 
             await interaction.response.edit_message(view=self)
 
@@ -690,6 +694,39 @@ class RadioBot(commands.Cog):
     def _user_slots_remaining(self, gid: int, user_id: int) -> int:
         have = self._count_user_queued(gid, user_id, include_filler=False)
         return max(0, self._per_user_max(gid) - have)
+
+    async def _check_requester_in_vc(self, ctx, song: dict) -> bool:
+        """
+        Check if the requester of a song is still in the voice channel.
+        Returns True if requester is in VC (or if check should be skipped), False otherwise.
+        
+        Skips check for:
+        - Autofill tracks (they have _autofill flag)
+        - Tracks without a requester_id
+        - If SKIP_IF_REQUESTER_LEFT is disabled
+        """
+        # Skip check if feature is disabled
+        if not SKIP_IF_REQUESTER_LEFT:
+            return True
+        
+        # Skip check for autofill tracks
+        if song.get("_autofill"):
+            return True
+        
+        # Skip check if no requester_id
+        requester_id = song.get("requester_id")
+        if not requester_id:
+            return True
+        
+        # Skip check if no voice client or channel
+        if not ctx.voice_client or not ctx.voice_client.channel:
+            return True
+        
+        # Check if requester is in the voice channel
+        vc_members = ctx.voice_client.channel.members
+        requester_in_vc = any(member.id == requester_id for member in vc_members)
+        
+        return requester_in_vc
 
     def _deny_user_cap_embed(self, requester_mention: str | None = None, gid: int | None = None) -> discord.Embed:
         cap = self._per_user_max(gid) if gid is not None else QUEUE_MAX_PER_USER
@@ -1182,7 +1219,7 @@ class RadioBot(commands.Cog):
         embed = discord.Embed(title="👋 Left", description=f"Left {channel_name} 🎧", color=0xff0000)
         await ctx.send(embed=embed)
 
-    @commands.command(name='play')
+    @commands.command(name='play', aliases=['Play'])
     @app_commands.describe(channel='Play a song using !play [url]')
     async def play(self, ctx, url: str = ""):
         """
@@ -1346,6 +1383,35 @@ class RadioBot(commands.Cog):
 
             channel = self.get_radio_channel(ctx)
             song = queue.popleft()
+
+            # Check if requester is still in VC before playing
+            requester_in_vc = await self._check_requester_in_vc(ctx, song)
+            if not requester_in_vc:
+                # Requester left, skip this song
+                requester_mention = (
+                    song.get("requester_mention")
+                    or (f"<@{song['requester_id']}>" if song.get("requester_id") else None)
+                    or song.get("requester_tag")
+                    or song.get("requester_name")
+                    or "someone"
+                )
+                song_title = song.get("title") or "Unknown"
+                
+                if SHOW_SKIP_MESSAGE:
+                    skip_embed = discord.Embed(
+                        title="⏭️ Skipped",
+                        description=f"Skipped **{_truncate(song_title, 200)}** - {requester_mention} is no longer in the voice channel.",
+                        color=0xff9900
+                    )
+                    try:
+                        await channel.send(embed=skip_embed)
+                    except Exception:
+                        pass
+                
+                # Continue to next song in queue
+                if queue and ctx.voice_client:
+                    self.bot.loop.create_task(self.play_next(ctx))
+                return
 
             track_id = _canonical_track_id(song)
             if track_id:
@@ -2182,7 +2248,7 @@ class RadioBot(commands.Cog):
         amap = self.user_mappings.get(gid)
         if not isinstance(amap, dict):
             amap = {}
-            self.user_mappings[guild_id] = amap
+            self.user_mappings[gid] = amap
         ainfo = amap.get("autofill", {})
         enabled_state = bool(self.auto_play_enabled.get(gid, ainfo.get("enabled", True)))
         ainfo["enabled"] = enabled_state
@@ -2201,6 +2267,85 @@ class RadioBot(commands.Cog):
             description="\n".join(desc_lines),
             color=0x3498db
         ))
+
+    @commands.command(name="twss", hidden=True)
+    async def twss(self, ctx):
+        """
+        Post a random GIF URL from twss.csv located in the same directory as the autofill CSV.
+        If the command is used as a reply, the bot will reply to the same message.
+        """
+        # Get the reference from the command message (if it was a reply)
+        reference = ctx.message.reference
+        
+        # Get the autofill CSV path to determine the directory
+        gid = ctx.guild.id
+        csv_path = None
+        
+        try:
+            amap = self.user_mappings.get(gid) or {}
+            ainfo = amap.get("autofill") or {}
+            csv_path = (ainfo.get("csv") or "").strip()
+        except Exception:
+            csv_path = ""
+        
+        if not csv_path:
+            csv_path = (
+                os.getenv("AUTOFILL_CSV_PATH", "").strip()
+                or os.getenv("DEFAULT_AUTOFILL_CSV", "").strip()
+                or getattr(self, "_autofill_csv_path", "").strip()
+                or "autofill.csv"
+            )
+        
+        # Get the directory from the autofill CSV path
+        if csv_path:
+            autofill_dir = os.path.dirname(os.path.abspath(os.path.expanduser(csv_path)))
+            twss_path = os.path.join(autofill_dir, "twss.csv")
+        else:
+            # Fallback to current directory or same location as autofill.csv
+            twss_path = "twss.csv"
+        
+        twss_path = os.path.abspath(os.path.expanduser(twss_path))
+        
+        # Load URLs from twss.csv
+        urls = []
+        try:
+            if not os.path.exists(twss_path):
+                await ctx.send(embed=discord.Embed(
+                    title="❌ TWSS CSV Not Found",
+                    description=f"Could not find `twss.csv` at `{twss_path}`.",
+                    color=0xe74c3c
+                ), reference=reference)
+                return
+            
+            with open(twss_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    # Get first column as URL
+                    url = (row[0] or "").strip()
+                    # Skip empty rows and header rows
+                    if url and not url.lower().startswith("url") and not url.startswith("#"):
+                        urls.append(url)
+        except Exception as e:
+            await ctx.send(embed=discord.Embed(
+                title="❌ Error Reading TWSS CSV",
+                description=f"Failed to read `twss.csv`: {type(e).__name__}: {e}",
+                color=0xe74c3c
+            ), reference=reference)
+            return
+        
+        if not urls:
+            await ctx.send(embed=discord.Embed(
+                title="❌ No URLs Found",
+                description=f"No valid URLs found in `twss.csv` at `{twss_path}`.",
+                color=0xe74c3c
+            ), reference=reference)
+            return
+        
+        # Pick a random URL and send it
+        random_url = random.choice(urls)
+        await ctx.send(random_url, reference=reference)
 
     @commands.has_permissions(administrator=True)
     @commands.command(name="queue_limit_on")
