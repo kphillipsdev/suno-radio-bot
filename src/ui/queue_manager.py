@@ -1,7 +1,7 @@
 # src/ui/queue_manager.py
 from __future__ import annotations
 
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Callable, Awaitable
 
 import discord
 from discord.ext import commands
@@ -64,8 +64,8 @@ def build_queue_embed(guild: discord.Guild, queue: Sequence[dict]) -> discord.Em
             dur_str = _fmt_duration(dur)
 
         lines.append(
-            f"{idx}. **{title}**\n"
-            f"   _by {artist}_ • ⏱ {dur_str} • Requested by {requester}"
+            f"{idx}. **{title}**\n "
+            f"by {artist} ({dur_str}) / Requested by {requester}"
         )
 
     remaining = len(queue) - MAX_LINES
@@ -101,12 +101,14 @@ class QueueManagerView(discord.ui.View):
         queue,
         invoker: discord.abc.User,
         timeout: float | None = 300.0,
+        on_timeout_callback: Optional[Callable[[int], Awaitable[None]]] = None,
     ) -> None:
         super().__init__(timeout=timeout)
         self.guild = guild
         self.queue = queue          # expected: collections.deque of dicts
         self.invoker = invoker
         self.message: Optional[discord.Message] = None
+        self.on_timeout_callback = on_timeout_callback
 
         self.selected_index: Optional[int] = None  # 0-based index in queue
 
@@ -385,3 +387,12 @@ class QueueManagerView(discord.ui.View):
             return await self._reject(interaction)
 
         await self._sync_message(interaction)
+
+    async def on_timeout(self) -> None:
+        """Called when the view times out. Clean up tracking if callback provided."""
+        if self.on_timeout_callback:
+            try:
+                await self.on_timeout_callback(self.guild.id)
+            except Exception:
+                pass
+        await super().on_timeout()

@@ -5,7 +5,6 @@ from discord import ui, app_commands
 from collections import deque, defaultdict
 import asyncio
 import random
-import logging
 import os
 import concurrent.futures
 import time
@@ -15,10 +14,10 @@ import csv
 from pathlib import Path
 from discord.utils import escape_markdown
 from src.data.persistence import load_data, save_data
-from src.utils.yt_extractor import extract_song_info
-from src.utils.scraper import scrape_suno_songs
+from src.utils.extractor import extract_song_info
+from src.utils.song_list_scraper import scrape_suno_songs
 from src.utils.prefetch import prefetch_to_file
-from src.data.db import like_track, unlike_track, has_liked, get_like_count, top_liked_for_users
+from src.data.db import like_track, unlike_track, get_like_count, get_user_like_count, top_liked_for_users
 from src.utils.shuffle_displacing_first import shuffle_displacing_first_inplace
 from src.ui.queue_manager import QueueManagerView, build_queue_embed
 
@@ -250,6 +249,9 @@ def _prompt_text(track: dict) -> str:
 def _thumb(track: dict) -> str | None:
     return track.get("thumbnail") or track.get("thumb") or track.get("image")
 
+def _video_url(track: dict) -> str | None:
+    return track.get("video_url") or track.get("video")
+
 def _format_upcoming_list(tracks: list[dict], limit: int = 2) -> str:
     if not tracks:
         return "—"
@@ -329,6 +331,11 @@ def build_now_playing_embed(track: dict, requester_mention: str | None, upcoming
     if thumb:
         embed.set_thumbnail(url=thumb)
 
+    video = _video_url(track)
+    if video:
+        # Try using set_image for video - Discord may display it as a video preview
+        embed.set_image(url=video)
+
     embed.set_footer(text="Suno Radio")
     embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
     return embed
@@ -393,7 +400,35 @@ def _render_song_header(song: dict) -> str:
         title_md = f"**{title}**"
 
     byline_md = f"*By {artist}*"
-    return f"{title_md}\n{byline_md}".strip()
+    
+    parts = [title_md, byline_md]
+    
+    # Add model version/name
+    model_version = song.get("major_model_version")
+    model_name = song.get("model_name")
+    if model_version or model_name:
+        model_line = model_version or ""
+        if model_name:
+            if model_line:
+                model_line = f"{model_line} ({model_name})"
+            else:
+                model_line = model_name
+        if model_line:
+            parts.append(model_line)
+    
+    # Add stats
+    play_count = song.get("play_count")
+    like_count = song.get("like_count")
+    if play_count is not None or like_count is not None:
+        stats_parts = []
+        if play_count is not None:
+            stats_parts.append(f"{play_count:,} plays")
+        if like_count is not None:
+            stats_parts.append(f"{like_count:,} likes")
+        if stats_parts:
+            parts.append(" / ".join(stats_parts))
+    
+    return "\n".join(parts).strip()
 
 
 def _render_prompt_lyrics_block(song: dict) -> str:
@@ -408,6 +443,79 @@ def _render_prompt_lyrics_block(song: dict) -> str:
     parts.append(lyrics if lyrics else "_No lyrics provided._")
 
     return "\n".join(parts).strip()
+
+def build_song_info_embed(song: dict) -> discord.Embed:
+    """
+    Build the song info embed (same as song_info command).
+    Used for displaying lyrics and prompt information.
+    """
+    song = song.copy()
+    
+    # Build the embed
+    header = _render_song_header(song)
+    prompt_lyrics = _render_prompt_lyrics_block(song)
+    
+    # Split long content if needed (Discord embed description limit is 4096)
+    # We'll use description for header and first chunk, then fields for overflow
+    description_parts = [header]
+    
+    # Try to fit prompt/lyrics in description first
+    combined_length = len(header) + len("\n\n") + len(prompt_lyrics)
+    if combined_length <= 4000:  # Leave some margin
+        description_parts.append("")
+        description_parts.append(prompt_lyrics)
+        embed = discord.Embed(
+            title="📝 Song Information",
+            description="\n".join(description_parts),
+            color=EMBED_COLOR_PLAYING
+        )
+    else:
+        # Need to chunk it
+        embed = discord.Embed(
+            title="📝 Song Information",
+            description=header,
+            color=EMBED_COLOR_PLAYING
+        )
+        # Split prompt and lyrics separately for better formatting
+        prompt = (song.get("prompt") or "").strip()
+        lyrics = (song.get("lyrics") or "").strip()
+        
+        if prompt:
+            prompt_chunks = _chunk_text(prompt, limit=1020)  # Field value limit is 1024
+            for i, chunk in enumerate(prompt_chunks):
+                embed.add_field(
+                    name="**Prompt**" if i == 0 else f"",
+                    value=chunk,
+                    inline=False
+                )
+        else:
+            embed.add_field(name="**Prompt**", value="_No prompt provided._", inline=False)
+        
+        if lyrics:
+            lyrics_chunks = _chunk_text(lyrics, limit=1020)
+            for i, chunk in enumerate(lyrics_chunks):
+                embed.add_field(
+                    name="**Lyrics**" if i == 0 else f"",
+                    value=chunk,
+                    inline=False
+                )
+        else:
+            embed.add_field(name="**Lyrics**", value="_No lyrics provided._", inline=False)
+    
+    # Add duration if available
+    duration = song.get("duration")
+    if duration:
+        embed.add_field(name="Duration", value=_fmt_duration(duration), inline=True)
+    
+    # Add thumbnail if available
+    thumb = _thumb(song)
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    
+    embed.set_footer(text="Suno Radio")
+    embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+    return embed
+
 # ---------------------------------------------------------------------------
 
 LIKE_EMOJI_NAME = "sunobotlike"
@@ -433,6 +541,8 @@ class LikeView(discord.ui.View):
         self.song_title = song_title or "Untitled"
         self.song_url = (song_url or "").strip()
         self.show_count = show_count
+        # Track which users have clicked in this view instance
+        self.user_clicked = set()
 
         try:
             count = get_like_count(track_id=track_id, guild_id=guild_id)
@@ -461,20 +571,71 @@ class LikeView(discord.ui.View):
             return await interaction.response.defer(ephemeral=True)
 
         try:
-            if has_liked(track_id=self.track_id, guild_id=self.guild_id, user_id=interaction.user.id):
-                total = unlike_track(
-                    track_id=self.track_id, guild_id=self.guild_id, user_id=interaction.user.id
-                )
-                msg = f"Removed your like for **{self.song_title}**."
-                button.style = discord.ButtonStyle.primary
-                button.label = str(total) if self.show_count else "Save for Autofill"
+            user_id = interaction.user.id
+            has_clicked_before = user_id in self.user_clicked
+            
+            # Check if user has existing likes for this track
+            existing_user_likes = get_user_like_count(
+                track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+            )
+            
+            if has_clicked_before:
+                # On subsequent clicks in the same view: toggle like/unlike
+                if existing_user_likes > 0:
+                    # User has likes, so unlike (remove one like)
+                    total = unlike_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    if user_count == 0:
+                        msg = f"Removed your like for **{self.song_title}**."
+                    else:
+                        msg = f"Removed a like for **{self.song_title}**. (You still have {user_count} like{'s' if user_count != 1 else ''})"
+                else:
+                    # User has no likes, so like it
+                    total = like_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id,
+                        username=str(interaction.user),
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    if user_count > 1:
+                        msg = f"Saved to Autofill **{self.song_title}**! (You've liked this {user_count} times)"
+                    else:
+                        msg = f"Saved to Autofill **{self.song_title}**!"
             else:
-                total = like_track(
-                    track_id=self.track_id, guild_id=self.guild_id, user_id=interaction.user.id,
-                    username=str(interaction.user),
-                )
-                msg = f"Thanks for liking **{self.song_title}**!"
-                button.label = str(total) if self.show_count else "Save for Autofill"
+                # First click in this view
+                if existing_user_likes > 0:
+                    # User already has likes, so add another like
+                    total = like_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id,
+                        username=str(interaction.user),
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    msg = f"Saved to Autofill **{self.song_title}** again! (You've liked this {user_count} times)"
+                else:
+                    # User has no likes, so like it
+                    total = like_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id,
+                        username=str(interaction.user),
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    if user_count > 1:
+                        msg = f"Saved to Autofill **{self.song_title}**! (You've liked this {user_count} times)"
+                    else:
+                        msg = f"Saved to Autofill **{self.song_title}**!"
+                
+                # Mark that this user has clicked in this view
+                self.user_clicked.add(user_id)
+            
+            button.label = str(total) if self.show_count else "Save for Autofill"
 
             await interaction.response.edit_message(view=self)
 
@@ -490,6 +651,189 @@ class LikeView(discord.ui.View):
                 await interaction.response.send_message(f"❌ Failed: {e}", ephemeral=True)
             except Exception:
                 pass
+
+
+class LyricsButton(discord.ui.Button):
+    """Button for viewing lyrics/prompt."""
+    def __init__(self, song: dict):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="View Lyrics/Prompt"
+        )
+        self.song = song.copy()
+    
+    async def callback(self, interaction: discord.Interaction):
+        """Handle the View Lyrics/Prompt button click."""
+        if interaction.user.bot:
+            return await interaction.response.defer(ephemeral=True)
+        
+        try:
+            embed = build_song_info_embed(self.song)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.response.send_message(
+                    f"❌ Failed to load song information: {e}",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
+
+
+class LikeButton(discord.ui.Button):
+    """Button for liking/saving songs."""
+    def __init__(
+        self,
+        track_id: str,
+        guild_id: int,
+        song_title: str,
+        song_url: str,
+        view_instance
+    ):
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label="Save for Autofill",
+            custom_id="suno_like_btn"
+        )
+        self.track_id = track_id
+        self.guild_id = guild_id
+        self.song_title = song_title
+        self.song_url = song_url
+        self.view_instance = view_instance
+        
+        # Set emoji
+        try:
+            self.emoji = discord.PartialEmoji(name=LIKE_EMOJI_NAME, id=LIKE_EMOJI_ID)
+        except Exception:
+            self.emoji = LIKE_FALLBACK
+    
+    async def callback(self, interaction: discord.Interaction):
+        """Handle the like button click (same logic as LikeView)."""
+        if interaction.user.bot:
+            return await interaction.response.defer(ephemeral=True)
+        
+        try:
+            user_id = interaction.user.id
+            has_clicked_before = user_id in self.view_instance.user_clicked
+            
+            # Check if user has existing likes for this track
+            existing_user_likes = get_user_like_count(
+                track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+            )
+            
+            if has_clicked_before:
+                # On subsequent clicks in the same view: toggle like/unlike
+                if existing_user_likes > 0:
+                    # User has likes, so unlike (remove one like)
+                    total = unlike_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    if user_count == 0:
+                        msg = f"Removed your like for **{self.song_title}**."
+                    else:
+                        msg = f"Removed a like for **{self.song_title}**. (You still have {user_count} like{'s' if user_count != 1 else ''})"
+                else:
+                    # User has no likes, so like it
+                    total = like_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id,
+                        username=str(interaction.user),
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    if user_count > 1:
+                        msg = f"Saved to Autofill **{self.song_title}**! (You've added this {user_count} times)"
+                    else:
+                        msg = f"Saved to Autofill **{self.song_title}**!"
+            else:
+                # First click in this view
+                if existing_user_likes > 0:
+                    # User already has likes, so add another like
+                    total = like_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id,
+                        username=str(interaction.user),
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    msg = f"Saved to Autofill **{self.song_title}** again! (You've added this {user_count} times)"
+                else:
+                    # User has no likes, so like it
+                    total = like_track(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id,
+                        username=str(interaction.user),
+                    )
+                    user_count = get_user_like_count(
+                        track_id=self.track_id, guild_id=self.guild_id, user_id=user_id
+                    )
+                    if user_count > 1:
+                        msg = f"Saved to Autofill **{self.song_title}**! (You've added this {user_count} times)"
+                    else:
+                        msg = f"Saved to Autofill **{self.song_title}**!"
+                
+                # Mark that this user has clicked in this view
+                self.view_instance.user_clicked.add(user_id)
+            
+            self.label = "Save for Autofill"
+            
+            await interaction.response.edit_message(view=self.view_instance)
+            
+            if self.song_url.startswith("http"):
+                link_view = discord.ui.View()
+                link_view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=self.song_url, label="Open on Suno"))
+                await interaction.followup.send(msg, view=link_view, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
+        
+        except Exception as e:
+            try:
+                await interaction.response.send_message(f"❌ Failed: {e}", ephemeral=True)
+            except Exception:
+                pass
+
+
+class NowPlayingView(discord.ui.View):
+    """
+    View for the now playing card that includes both the like button (if applicable)
+    and a "View Lyrics/Prompt" button.
+    """
+    def __init__(
+        self,
+        *,
+        song: dict,
+        track_id: str | None = None,
+        guild_id: int | None = None,
+        bot_user_id: int | None = None,
+        song_title: str | None = None,
+        song_url: str | None = None,
+        timeout: float | None = 3600,
+    ):
+        super().__init__(timeout=timeout)
+        self.song = song.copy()
+        self.track_id = track_id
+        self.guild_id = guild_id
+        self.bot_user_id = bot_user_id
+        self.song_title = song_title or (song.get("title") or "Untitled")
+        self.song_url = (song_url or "").strip()
+        self.user_clicked = set()
+        
+        # Add like button if track_id is provided
+        if track_id and guild_id and bot_user_id:
+            like_btn = LikeButton(
+                track_id=track_id,
+                guild_id=guild_id,
+                song_title=self.song_title,
+                song_url=self.song_url,
+                view_instance=self
+            )
+            self.add_item(like_btn)
+        
+        # Always add lyrics/prompt button
+        lyrics_btn = LyricsButton(song=self.song)
+        self.add_item(lyrics_btn)
 
 # ===== Music Cog =============================================================
 class RadioBot(commands.Cog):
@@ -520,6 +864,9 @@ class RadioBot(commands.Cog):
         self._song_index = defaultdict(int)
         self._np_track = defaultdict(list)
         self._np_retention_n = REMOVE_NP_AFTER_SONGS
+
+        # --- QPanel message tracking (for cleanup) -----------------------------
+        self._qpanel_messages = {}  # guild_id -> discord.Message
 
     def _is_admin(self, member: discord.Member) -> bool:
         """Admins bypass queue limitations."""
@@ -620,36 +967,6 @@ class RadioBot(commands.Cog):
         if 0 <= idx < len(q):
             return list(q)[idx], f"Queued song #{idx+1}"
         return None, f"Invalid position. Must be between 1 and {len(q)}."
-
-    async def _ensure_song_metadata(self, song: dict) -> dict:
-        need_prompt = not song.get("prompt")
-        need_lyrics = not song.get("lyrics")
-        if not (need_prompt or need_lyrics):
-            return song
-
-        page_url = song.get("suno_url") or _derive_suno_url(song) or song.get("url") or ""
-        if not page_url:
-            return song
-
-        loop = asyncio.get_running_loop()
-
-        def _do_extract():
-            try:
-                return extract_song_info(page_url)
-            except Exception as e:
-                print(f"[song_info] refresh extract failed for {page_url}: {e}")
-                return None
-
-        info = await loop.run_in_executor(None, _do_extract)
-        if not info:
-            return song
-
-        for k in ("prompt", "lyrics", "title", "artist", "duration", "thumbnail"):
-            if (k not in song or song.get(k) in (None, "", 0)) and info.get(k):
-                song[k] = info[k]
-        if not song.get("suno_url") and info.get("suno_url"):
-            song["suno_url"] = info["suno_url"]
-        return song
 
     def _estimate_eta_seconds(self, gid: int, position: int) -> tuple[int | None, bool]:
         eta = 0
@@ -1299,6 +1616,8 @@ class RadioBot(commands.Cog):
                 await ctx.send(embed=embed)
             else:
                 song = extract_song_info(url)
+                if song is None:
+                    raise ValueError("Failed to extract song information: extract_song_info returned None")
                 song.setdefault("artist", song.pop("author", None))
 
                 song["requester_id"] = requester_id
@@ -1590,15 +1909,14 @@ class RadioBot(commands.Cog):
             song_url = _derive_suno_url(song) or (song.get("url") or "")
             song_title = song.get("title") or song.get("track_id") or "Untitled"
 
-            view = None
-            if song.get("_track_id"):
-                view = LikeView(
-                    track_id=song["_track_id"],
-                    guild_id=ctx.guild.id,
-                    bot_user_id=(self.bot.user.id if self.bot.user else 0),
-                    song_title=song_title,
-                    song_url=song_url,
-                )
+            view = NowPlayingView(
+                song=song,
+                track_id=song.get("_track_id"),
+                guild_id=ctx.guild.id,
+                bot_user_id=(self.bot.user.id if self.bot.user else 0),
+                song_title=song_title,
+                song_url=song_url,
+            )
 
             ch = self.get_radio_channel(ctx)
             sent_message = await ch.send(embed=np_embed, view=view)
@@ -1810,6 +2128,23 @@ class RadioBot(commands.Cog):
         if ctx.voice_client and ctx.voice_client.source:
             if hasattr(ctx.voice_client.source, 'volume'):
                 ctx.voice_client.source.volume = self.volumes[guild_id]
+
+    @commands.command(name='song_info')
+    async def song_info(self, ctx):
+        """
+        Display detailed information about the currently playing song, including lyrics and prompt.
+        """
+        if not self.current_song:
+            embed = discord.Embed(
+                title="❌ No Song Playing",
+                description="There's no song currently playing. Use `!play` to start playing music!",
+                color=0xff0000
+            )
+            await ctx.send(embed=embed)
+            return
+
+        embed = build_song_info_embed(self.current_song)
+        await ctx.send(embed=embed)
 
     @commands.command(name='playlist')
     async def playlist(self, ctx, url: str, max_items: int = 100):
@@ -2530,14 +2865,35 @@ class RadioBot(commands.Cog):
             await ctx.send("The queue is currently empty.")
             return
 
+        # Delete previous qpanel message if it exists
+        if guild_id in self._qpanel_messages:
+            old_msg = self._qpanel_messages[guild_id]
+            try:
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                # Message already deleted or we don't have permission - ignore
+                pass
+            finally:
+                # Remove from tracking even if deletion failed
+                del self._qpanel_messages[guild_id]
+
+        # Cleanup callback for when view times out
+        async def cleanup_callback(gid: int) -> None:
+            if gid in self._qpanel_messages:
+                del self._qpanel_messages[gid]
+
         view = QueueManagerView(
             guild=ctx.guild,
             queue=queue,          # this is your live deque
             invoker=ctx.author,
+            on_timeout_callback=cleanup_callback,
         )
         embed = build_queue_embed(ctx.guild, queue)
         msg = await ctx.send(embed=embed, view=view)
         view.message = msg
+        
+        # Track the new qpanel message
+        self._qpanel_messages[guild_id] = msg
 
     @commands.Cog.listener()
     async def on_command_completion(self, ctx: commands.Context) -> None:

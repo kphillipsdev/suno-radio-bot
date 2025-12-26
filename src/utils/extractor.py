@@ -7,47 +7,20 @@ import requests
 from typing import Optional, Dict, Tuple, List
 from bs4 import BeautifulSoup
 
-# =========================
-# Small text/HTML helpers
-# =========================
-
-def _collapse_ws(s: str) -> str:
-    return re.sub(r"[ \t\u00A0]+", " ", (s or "")).strip()
-
-def _normalize_newlines(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-def _text_with_breaks(el) -> str:
-    parts = []
-    def walk(node):
-        name = getattr(node, "name", None)
-        if name is None:
-            parts.append(str(node))
-            return
-        if name.lower() == "br":
-            parts.append("\n")
-        elif name.lower() in {"p", "div", "section", "article", "li", "pre"}:
-            for c in node.children:
-                walk(c)
-            parts.append("\n")
-        else:
-            for c in node.children:
-                walk(c)
-    walk(el)
-    s = "".join(parts)
-    s = html.unescape(s)
-    s = "\n".join(line.rstrip() for line in s.split("\n"))
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+# Import extraction functions from extractor module
+from src.utils.song_scraper import (
+    extract_lyrics, 
+    extract_style_prompt, 
+    extract_video_url,
+    extract_image_url,
+    extract_model_info,
+    extract_play_count,
+    extract_like_count
+)
 
 # =========================
 # Duration helpers
 # =========================
-
 def _iso8601_to_seconds(s: str) -> Optional[int]:
     if not s:
         return None
@@ -136,89 +109,6 @@ def _extract_from_ld_json(soup: BeautifulSoup) -> dict:
                 out["duration"] = sec
     return out
 
-def _extract_prompt_lyrics_from_dom(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
-    # Your previous SSR heuristics, kept as-is
-    prompt = None
-    pr = soup.select_one("div.my-2 div[title]")
-    if pr:
-        prompt = pr.get("title") or pr.get_text(strip=True)
-    prompt = _normalize_newlines(prompt)
-
-    lyrics = None
-    lyr = soup.select_one("textarea.custom-textarea") or soup.select_one("p.whitespace-pre-wrap")
-    if lyr:
-        if lyr.name == "textarea":
-            lyrics = lyr.string or lyr.get_text()
-        else:
-            lyrics = _text_with_breaks(lyr)
-    lyrics = _normalize_newlines(lyrics)
-
-    return prompt, lyrics
-
-def _extract_prompt_lyrics_from_scripts(raw_html: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Best-effort parse of embedded JSON (e.g., Next.js data) to recover prompt/lyrics
-    without executing JS.
-    """
-    # 1) Look for a big JSON blob (Next.js __NEXT_DATA__)
-    prompt = None
-    lyrics = None
-
-    # Try to capture JSON blobs from <script> tags even if attributes stripped during SSR/CDN
-    script_jsons: List[str] = re.findall(
-        r"<script[^>]*>(\s*{[\s\S]*?})\s*</script>", raw_html, flags=re.I
-    )
-
-    # Also pick up quoted strings and scan for fields if the JSON is broken across tags
-    quoted_strings = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', raw_html)
-
-    def _maybe_unescape(s: str) -> str:
-        try:
-            return bytes(s, "utf-8").decode("unicode_escape")
-        except Exception:
-            return s
-
-    # Pass 1: full JSON blobs
-    for blob in script_jsons:
-        data = _safe_json_loads(blob)
-        if not data:
-            continue
-
-        def _walk(o):
-            nonlocal prompt, lyrics
-            if isinstance(o, dict):
-                # common keys we’ve seen in the wild
-                for k, v in o.items():
-                    lk = str(k).lower()
-                    if isinstance(v, (str, bytes)):
-                        val = v if isinstance(v, str) else v.decode("utf-8", "ignore")
-                        if prompt is None and ("prompt" in lk or "description" in lk) and len(val.strip()) > 10:
-                            prompt = val.strip()
-                        if lyrics is None and ("lyrics" in lk or "songtext" in lk) and len(val.strip()) > 10:
-                            lyrics = val.strip()
-                    else:
-                        _walk(v)
-            elif isinstance(o, list):
-                for it in o:
-                    _walk(it)
-
-        _walk(data)
-        if prompt and lyrics:
-            break
-
-    # Pass 2: scan quoted strings for obvious prompt/lyrics content
-    if not (prompt and lyrics):
-        for qs in quoted_strings:
-            s = _maybe_unescape(qs)
-            if prompt is None and len(s) > 20 and ("verse" in s.lower() or "chorus" in s.lower() or "prompt:" in s.lower()):
-                prompt = s.strip()
-            # heuristic: lyrics often multi-line with punctuation/newlines
-            if lyrics is None and ("\n" in s or "\\n" in qs) and len(s) > 40 and any(w in s.lower() for w in ("verse", "chorus", "bridge")):
-                lyrics = s.strip()
-            if prompt and lyrics:
-                break
-
-    return _normalize_newlines(prompt), _normalize_newlines(lyrics)
 
 def _extract_audio_url_from_meta_or_html(soup: BeautifulSoup, raw_html: str, song_id: Optional[str]) -> Optional[str]:
     # Preferred: meta tags
@@ -245,6 +135,8 @@ def _extract_audio_url_from_meta_or_html(soup: BeautifulSoup, raw_html: str, son
 
     return None
 
+
+
 # =========================
 # Main extraction
 # =========================
@@ -258,19 +150,16 @@ def extract_song_info(url: str) -> dict:
     if "suno.com/song/" in url:
         try:
             headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Connection": "keep-alive",
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
-            resp = requests.get(url, headers=headers, timeout=12)
-            resp.raise_for_status()
-            raw_html = resp.text
-            soup = BeautifulSoup(raw_html, "html.parser")
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            raw_html = response.text
+            # Try lxml first (faster), fall back to html.parser (always available)
+            try:
+                soup = BeautifulSoup(raw_html, 'lxml')
+            except Exception:
+                soup = BeautifulSoup(raw_html, 'html.parser')
 
             # Title
             title_meta = soup.find("meta", property="og:title")
@@ -329,14 +218,16 @@ def extract_song_info(url: str) -> dict:
                 ld = _extract_from_ld_json(soup)
                 duration = ld.get("duration") or duration
 
-            # Prompt & Lyrics (DOM first)
-            prompt, lyrics = _extract_prompt_lyrics_from_dom(soup)
 
-            # If still missing, try embedded JSON/script blobs (Playwright-free)
-            if not prompt or not lyrics:
-                p2, l2 = _extract_prompt_lyrics_from_scripts(raw_html)
-                prompt = prompt or p2
-                lyrics = lyrics or l2
+            lyrics = extract_lyrics(soup, raw_html)
+            prompt = extract_style_prompt(soup, raw_html)
+            video_url = extract_video_url(soup, raw_html)
+            
+            # Extract additional information
+            image_url = extract_image_url(soup)
+            model_info = extract_model_info(soup)
+            play_count = extract_play_count(soup)
+            like_count = extract_like_count(soup)
 
             # Audio URL (meta -> html regex -> construct)
             audio_url = _extract_audio_url_from_meta_or_html(soup, raw_html, song_id)
@@ -368,57 +259,19 @@ def extract_song_info(url: str) -> dict:
                 "artist": artist,
                 "suno_url": f"https://suno.com/song/{song_id}" if song_id else url,
                 "thumbnail": thumbnail,
-                "prompt": _normalize_newlines(prompt),
-                "lyrics": _normalize_newlines(lyrics),
+                "video_url": video_url,
+                "prompt": prompt,
+                "lyrics": lyrics,
+                "image_url": image_url,
+                "major_model_version": model_info.get("major_model_version"),
+                "model_name": model_info.get("model_name"),
+                "play_count": play_count,
+                "like_count": like_count,
             }
 
         except Exception as e:
-            print(f"Suno direct extraction failed: {e}, falling back to yt_dlp generic")
-
-    # ===== Generic yt-dlp extraction for non-Suno URLs =====
-    try:
-        import yt_dlp
-    except Exception as e:
-        raise RuntimeError(
-            "yt_dlp is required for this URL type but not installed or failed to import."
-        ) from e
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "extractaudio": True,
-        "audioquality": 1,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "prefer_ffmpeg": True,
-        "retries": 5,
-        "fragment_retries": 10,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = info.get("title", "Unknown Title")
-        audio_url = info.get("url")
-        duration = info.get("duration")
-        if duration is None and audio_url:
-            duration = _ffprobe_duration(audio_url) or _yt_dlp_probe_duration(audio_url)
-
-        artist = info.get("artist") or info.get("uploader") or info.get("channel") or None
-        date = info.get("upload_date")
-        thumbnail = info.get("thumbnail")
-        prompt = info.get("description")
-
-        if not audio_url:
-            raise ValueError("No playable URL found in extracted info")
-
-        return {
-            "title": title,
-            "url": audio_url,
-            "duration": duration,
-            "date": date,
-            "artist": artist,
-            "suno_url": None,
-            "thumbnail": thumbnail,
-            "prompt": _normalize_newlines(prompt),
-            "lyrics": None,
-        }
+            print(f"Suno direct extraction failed: {e}")
+            raise  # Re-raise the exception so it can be handled by the caller
+    
+    # If URL doesn't match suno.com/song/, raise an error
+    raise ValueError(f"Unsupported URL format: {url}")

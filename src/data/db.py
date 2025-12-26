@@ -51,19 +51,89 @@ def init_db(db_path: Optional[str] = None) -> None:
         sql = f.read()
     conn.executescript(sql)
 
-    # Ensure likes table exists (safe to run every boot)
+    # Check if likes table exists and needs migration
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='likes'")
+    table_exists = cursor.fetchone() is not None
+    
+    if table_exists:
+        # Check if the table has the old schema (composite PRIMARY KEY)
+        cursor = conn.execute("PRAGMA table_info(likes)")
+        rows = cursor.fetchall()
+        # row factory returns dicts, so access by column name
+        column_names = [row['name'] for row in rows]
+        
+        # Check if table has 'id' column
+        has_id_column = 'id' in column_names
+        
+        # Check for composite PRIMARY KEY by looking at table definition
+        cursor = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='likes'")
+        table_sql_row = cursor.fetchone()
+        table_sql = (table_sql_row.get('sql', '') if isinstance(table_sql_row, dict) else (table_sql_row[0] if table_sql_row else '')).upper()
+        
+        # Check if there's a composite PRIMARY KEY (old schema)
+        # Look for PRIMARY KEY with multiple columns (track_id, guild_id, user_id)
+        # Normalize the SQL by removing extra spaces for comparison
+        normalized_sql = ' '.join(table_sql.split()) if table_sql else ""
+        has_composite_pk = (
+            table_sql and 
+            ('PRIMARY KEY (TRACK_ID, GUILD_ID, USER_ID)' in normalized_sql or
+             'PRIMARY KEY(TRACK_ID,GUILD_ID,USER_ID)' in normalized_sql.replace(' ', '') or
+             'PRIMARY KEY(TRACK_ID,GUILD_ID,USER_ID)' in normalized_sql)
+        )
+        
+        # Also check if there's a unique index on these columns (which would prevent duplicates)
+        cursor = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='likes'")
+        indexes = cursor.fetchall()
+        has_unique_constraint = False
+        for idx_row in indexes:
+            idx_sql = idx_row.get('sql', '') if isinstance(idx_row, dict) else (idx_row[0] if idx_row else '')
+            if idx_sql and ('UNIQUE' in idx_sql.upper() or 'PRIMARY' in idx_sql.upper()):
+                idx_sql_upper = idx_sql.upper()
+                if 'TRACK_ID' in idx_sql_upper and 'GUILD_ID' in idx_sql_upper and 'USER_ID' in idx_sql_upper:
+                    has_unique_constraint = True
+                    break
+        
+        if not has_id_column or has_composite_pk or has_unique_constraint:
+            # Old schema detected - migrate to new schema
+            try:
+                print("[db migration] Migrating likes table to allow multiple likes per user...")
+                conn.execute("""
+                    CREATE TABLE likes_new (
+                      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                      track_id   TEXT NOT NULL,
+                      guild_id   TEXT NOT NULL,
+                      user_id    TEXT NOT NULL,
+                      username   TEXT,
+                      created_at INTEGER DEFAULT (strftime('%s','now')),
+                      FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+                    );
+                """)
+                conn.execute("INSERT INTO likes_new (track_id, guild_id, user_id, username, created_at) SELECT track_id, guild_id, user_id, username, created_at FROM likes;")
+                conn.execute("DROP TABLE likes;")
+                conn.execute("ALTER TABLE likes_new RENAME TO likes;")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_track_guild ON likes(track_id, guild_id);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_user ON likes(user_id, guild_id);")
+                print("[db migration] Successfully migrated likes table to allow multiple likes per user")
+            except Exception as e:
+                print(f"[db migration] Failed to migrate likes table: {e}")
+                # If migration fails, try to continue - might already be migrated
+                pass
+    
+    # Ensure likes table exists with new schema (safe to run every boot)
+    # Allow multiple likes from the same user for the same track
     conn.execute("""
     CREATE TABLE IF NOT EXISTS likes (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
       track_id   TEXT NOT NULL,
       guild_id   TEXT NOT NULL,
       user_id    TEXT NOT NULL,
       username   TEXT,
       created_at INTEGER DEFAULT (strftime('%s','now')),
-      PRIMARY KEY (track_id, guild_id, user_id),
       FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
     );
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_track_guild ON likes(track_id, guild_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_user ON likes(user_id, guild_id);")
 
 # ------------------------------
 # Track & Play helpers
@@ -181,10 +251,10 @@ def top_tracks(*, guild_id: int | str, since_seconds: Optional[int], limit: int 
     return conn.execute(sql, params).fetchall()
 
 def like_track(*, track_id: str, guild_id: int | str, user_id: int | str, username: str | None = None) -> int:
-    """Set a like (idempotent). Returns total likes for this track in this guild."""
+    """Add a like (allows multiple likes from same user). Returns total likes for this track in this guild."""
     conn = get_conn()
     conn.execute(
-        "INSERT OR IGNORE INTO likes(track_id, guild_id, user_id, username) VALUES(?,?,?,?)",
+        "INSERT INTO likes(track_id, guild_id, user_id, username) VALUES(?,?,?,?)",
         (track_id, str(guild_id), str(user_id), username),
     )
     row = conn.execute(
@@ -194,12 +264,18 @@ def like_track(*, track_id: str, guild_id: int | str, user_id: int | str, userna
     return int(row["c"])
 
 def unlike_track(*, track_id: str, guild_id: int | str, user_id: int | str) -> int:
-    """Remove a like. Returns new total."""
+    """Remove one like (the most recent one). Returns new total."""
     conn = get_conn()
-    conn.execute(
-        "DELETE FROM likes WHERE track_id=? AND guild_id=? AND user_id=?",
-        (track_id, str(guild_id), str(user_id)),
-    )
+    # Delete the most recent like for this user/track combination
+    conn.execute("""
+        DELETE FROM likes 
+        WHERE id = (
+            SELECT id FROM likes 
+            WHERE track_id=? AND guild_id=? AND user_id=?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        )
+    """, (track_id, str(guild_id), str(user_id)))
     row = conn.execute(
         "SELECT COUNT(*) AS c FROM likes WHERE track_id=? AND guild_id=?",
         (track_id, str(guild_id)),
@@ -219,6 +295,15 @@ def get_like_count(*, track_id: str, guild_id: int | str) -> int:
     row = conn.execute(
         "SELECT COUNT(*) AS c FROM likes WHERE track_id=? AND guild_id=?",
         (track_id, str(guild_id)),
+    ).fetchone()
+    return int(row["c"])
+
+def get_user_like_count(*, track_id: str, guild_id: int | str, user_id: int | str) -> int:
+    """Get the number of times a specific user has liked a track."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM likes WHERE track_id=? AND guild_id=? AND user_id=?",
+        (track_id, str(guild_id), str(user_id)),
     ).fetchone()
     return int(row["c"])
 
