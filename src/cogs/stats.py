@@ -10,6 +10,7 @@ import datetime
 from discord.utils import escape_markdown
 from src.data.db import recent_plays, top_tracks
 from src.data.db import get_conn
+from src.ui.pagination import PaginatedView
 
 # ===== Embed + Formatting Helpers ===========================================
 EMBED_COLOR_STATS = 0xfeb236
@@ -18,6 +19,7 @@ RANGE_TO_SECONDS = {
     "day": 24 * 3600,
     "week": 7 * 24 * 3600,
     "month": 30 * 24 * 3600,
+    "year": 365 * 24 * 3600,
     "all": None,
 }
 
@@ -56,6 +58,126 @@ def _embed_top(range_label, rows):
         lines.append(f"{i}. **{link}** by {artist} *({plays} unique plays)*")
     return discord.Embed(title=f"✨ Top Tracks ({range_label})", description="\n".join(lines), color=EMBED_COLOR_STATS)
 
+
+class PaginatedHistoryView(PaginatedView):
+    """
+    Paginated view for play history display.
+    """
+    
+    def __init__(
+        self,
+        *,
+        rows: list[dict],
+        timeout: float | None = 300.0,
+    ):
+        self.rows = rows
+        super().__init__(
+            total_items=len(rows),
+            items_per_page=15,
+            timeout=timeout,
+        )
+    
+    def _build_embed(self) -> discord.Embed:
+        """Build the embed for the current page."""
+        if not self.rows:
+            return discord.Embed(
+                title="⏯️ Recent Plays",
+                description="No history yet.",
+                color=EMBED_COLOR_ERROR
+            )
+        
+        # Calculate start and end indices for current page
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.rows))
+        
+        lines = []
+        for r in self.rows[start_idx:end_idx]:
+            started = _dt_from_epoch(int(r["started_at"]))
+            when = discord.utils.format_dt(started, style="R")
+            artist = f"by {r['artist']}" if r.get("artist") else ""
+            link = _title_link(r.get("title") or r.get("track_id"), r.get("source_url"))
+            lines.append(f"- {link} {artist} at {when}")
+        
+        description = "\n".join(lines) if lines else "No items on this page."
+        
+        embed = discord.Embed(
+            title="⏯️ Recent Plays",
+            description=description,
+            color=EMBED_COLOR_STATS
+        )
+        
+        # Add footer with page info
+        if self.total_pages > 1:
+            embed.set_footer(
+                text=f"Page {self.current_page + 1} of {self.total_pages} • "
+                     f"Showing items {start_idx + 1}-{end_idx} of {len(self.rows)}"
+            )
+        else:
+            embed.set_footer(text=f"Total: {len(self.rows)} item{'s' if len(self.rows) != 1 else ''}")
+        
+        return embed
+
+
+class PaginatedTopView(PaginatedView):
+    """
+    Paginated view for top tracks display.
+    """
+    
+    def __init__(
+        self,
+        *,
+        rows: list[dict],
+        range_label: str,
+        timeout: float | None = 300.0,
+    ):
+        self.rows = rows
+        self.range_label = range_label
+        super().__init__(
+            total_items=len(rows),
+            items_per_page=15,
+            timeout=timeout,
+        )
+    
+    def _build_embed(self) -> discord.Embed:
+        """Build the embed for the current page."""
+        if not self.rows:
+            return discord.Embed(
+                title=f"✨ Top Tracks ({self.range_label})",
+                description="No plays in that range.",
+                color=EMBED_COLOR_ERROR
+            )
+        
+        # Calculate start and end indices for current page
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.rows))
+        
+        lines = []
+        for i, r in enumerate(self.rows[start_idx:end_idx], start=start_idx + 1):
+            artist = f"{r['artist']}" if r.get("artist") else ""
+            link = _title_link(r.get("title") or r.get("track_id"), r.get("source_url"))
+            plays = r["plays"]
+            lines.append(f"{i}. **{link}** by {artist} *({plays} plays)*")
+        
+        description = "\n".join(lines) if lines else "No items on this page."
+        
+        embed = discord.Embed(
+            title=f"✨ Top Tracks ({self.range_label})",
+            description=description,
+            color=EMBED_COLOR_STATS
+        )
+        
+        # Add footer with page info
+        if self.total_pages > 1:
+            embed.set_footer(
+                text=f"Page {self.current_page + 1} of {self.total_pages} • "
+                     f"Showing items {start_idx + 1}-{end_idx} of {len(self.rows)}"
+            )
+        else:
+            embed.set_footer(text=f"Total: {len(self.rows)} item{'s' if len(self.rows) != 1 else ''}")
+        
+        return embed
+
+
 class Stats(commands.Cog):
     """History and Top commands for Suno Radio."""
 
@@ -63,38 +185,31 @@ class Stats(commands.Cog):
         self.bot = bot
 
     def _prune_orphan_tracks(self) -> int:
-        """Delete tracks that have no remaining plays. Returns rows deleted."""
+        """Delete tracks that have no remaining plays AND no likes. Returns rows deleted."""
         conn = get_conn()
         cur = conn.execute("""
             DELETE FROM tracks
             WHERE id NOT IN (SELECT DISTINCT track_id FROM plays)
+              AND id NOT IN (SELECT DISTINCT track_id FROM likes)
         """)
         return cur.rowcount or 0
 
     @app_commands.command(name="history", description="Show recent radio plays for this server")
-    @app_commands.describe(limit="How many rows (default 10, max 50)")
-    async def history(self, interaction: discord.Interaction, limit: int = 10):
+    @app_commands.describe(limit="How many rows (default 20, max 50)")
+    async def history(self, interaction: discord.Interaction, limit: int = 20):
         limit = max(1, min(50, limit))
         rows = recent_plays(guild_id=interaction.guild_id, limit=limit)
         if not rows:
             await interaction.response.send_message("No history yet.")
             return
 
-        lines = []
-        for r in rows:
-            started = _dt_from_epoch(int(r["started_at"]))
-            when = discord.utils.format_dt(started, style="R")
-            artist = f"by {r['artist']}" if r.get("artist") else ""
-            link = _title_link(r.get("title") or r.get("track_id"), r.get("source_url"))
-            lines.append(f"- {link} {artist} at {when}")
-
-
-        embed = discord.Embed(title="⏯️ Recent Plays", description="\n".join(lines), color = EMBED_COLOR_STATS)
-        await interaction.response.send_message(embed=embed)
+        view = PaginatedHistoryView(rows=rows)
+        await interaction.response.send_message(embed=view._build_embed(), view=view)
+        view.message = await interaction.original_response()
 
     @app_commands.command(name="top", description="Top played tracks for this server")
-    @app_commands.describe(range="Time window", limit="How many rows (default 10, max 25)")
-    async def top(self, interaction: discord.Interaction, range: Literal["day", "week", "month", "all"] = "week", limit: int = 10):
+    @app_commands.describe(range="Time window", limit="How many rows (default 20, max 25)")
+    async def top(self, interaction: discord.Interaction, range: Literal["day", "week", "month", "year", "all"] = "week", limit: int = 20):
         limit = max(1, min(25, limit))
         secs = RANGE_TO_SECONDS[range]
         rows = top_tracks(guild_id=interaction.guild_id, since_seconds=secs, limit=limit)
@@ -102,37 +217,52 @@ class Stats(commands.Cog):
             await interaction.response.send_message("No plays in that range.")
             return
 
-        lines = []
-        for i, r in enumerate(rows, start=1):
-            artist = f"by {r['artist']}" if r.get("artist") else ""
-            link = _title_link(r.get("title") or r.get("track_id"), r.get("source_url"))
-            lines.append(f"{i}. **{link}** {artist} *({plays} plays)*")
-
-        title = f"✨ Top Tracks ({range})"
-        embed = discord.Embed(title=title, description="\n".join(lines), color = EMBED_COLOR_STATS)
-        await interaction.response.send_message(embed=embed)
+        view = PaginatedTopView(rows=rows, range_label=range)
+        await interaction.response.send_message(embed=view._build_embed(), view=view)
+        view.message = await interaction.original_response()
 
     @commands.command(name="history", help="Show recent radio plays for this server")
-    async def history_bang(self, ctx: commands.Context, limit: int = 10):
+    async def history_bang(self, ctx: commands.Context, limit: int = 50):
         limit = max(1, min(50, int(limit)))
         rows = recent_plays(guild_id=ctx.guild.id, limit=limit)
-        await ctx.send(embed=_embed_recent(rows))
+        if not rows:
+            embed = discord.Embed(
+                title="⏯️ Recent Plays",
+                description="No history yet.",
+                color=EMBED_COLOR_ERROR
+            )
+            await ctx.send(embed=embed)
+            return
+        
+        view = PaginatedHistoryView(rows=rows)
+        await view.send(ctx.channel)
 
     @commands.command(name="top", help="Top played tracks for this server")
-    async def top_bang(self, ctx: commands.Context, range: str = "week", limit: int = 10):
-        # accept: day/week/month/all (case-insensitive)
+    async def top_bang(self, ctx: commands.Context, range: str = "week", limit: int = 50):
+        # accept: day/week/month/year/all (case-insensitive)
         rng = str(range).lower()
-        if rng not in ("day", "week", "month", "all"):
+        if rng not in ("day", "week", "month", "year", "all"):
             rng = "week"
         limit = max(1, min(25, int(limit)))
         secs = {
             "day": 24 * 3600,
             "week": 7 * 24 * 3600,
             "month": 30 * 24 * 3600,
+            "year": 365 * 24 * 3600,
             "all": None,
         }[rng]
         rows = top_tracks(guild_id=ctx.guild.id, since_seconds=secs, limit=limit)
-        await ctx.send(embed=_embed_top(rng, rows))
+        if not rows:
+            embed = discord.Embed(
+                title=f"✨ Top Tracks ({rng})",
+                description="No plays in that range.",
+                color=EMBED_COLOR_ERROR
+            )
+            await ctx.send(embed=embed)
+            return
+        
+        view = PaginatedTopView(rows=rows, range_label=rng)
+        await view.send(ctx.channel)
 
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.command(name="history_clear", description="Admin: clear play history")
@@ -157,9 +287,10 @@ class Stats(commands.Cog):
                 )
             else:  # all
                 conn.execute("DELETE FROM plays")
-                cur2 = conn.execute("DELETE FROM tracks")
+                pruned = self._prune_orphan_tracks()
                 await interaction.response.send_message(
-                    f"🧨 Cleared ALL history: **plays** and **tracks** (deleted {cur2.rowcount or 0} track rows).",
+                    f"🧨 Cleared ALL play history. "
+                    f"Pruned **{pruned}** orphan track(s) (tracks with no plays or likes).",
                     ephemeral=True
                 )
         except Exception as e:
@@ -185,11 +316,12 @@ class Stats(commands.Cog):
                 )
             elif scope == "all":
                 conn.execute("DELETE FROM plays")
-                cur2 = conn.execute("DELETE FROM tracks")
+                pruned = self._prune_orphan_tracks()
                 await ctx.send(
                     embed=discord.Embed(
-                        title="🧨 All History Cleared",
-                        description=f"Removed ALL plays and **{cur2.rowcount or 0}** track row(s).",
+                        title="🧨 All Play History Cleared",
+                        description=f"Removed ALL plays.\n"
+                                    f"Pruned **{pruned}** orphan track(s) (tracks with no plays or likes).",
                         color=0xe74c3c
                     )
                 )

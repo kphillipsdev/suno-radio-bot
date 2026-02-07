@@ -4,19 +4,27 @@ import html
 import json
 import subprocess
 import requests
+import urllib.parse
 from typing import Optional, Dict, Tuple, List
 from bs4 import BeautifulSoup
 
-# Import extraction functions from extractor module
-from src.utils.song_scraper import (
+# Import extraction functions from smart scraper module
+from src.utils.smart_scraper import (
     extract_lyrics, 
     extract_style_prompt, 
     extract_video_url,
     extract_image_url,
     extract_model_info,
     extract_play_count,
-    extract_like_count
+    extract_like_count,
+    extract_created_at
 )
+
+# yt-dlp based extractor for SoundCloud, Bandcamp, etc.
+from src.utils.ytdlp_extractor import extract_with_ytdlp, is_ytdlp_supported_url
+
+# Import image caching utility
+from src.utils.image_cache import download_image
 
 # =========================
 # Duration helpers
@@ -55,6 +63,74 @@ def _ffprobe_duration(url_or_path: str, headers: Dict | None = None, timeout: in
         pass
     return None
 
+def _ffprobe_metadata(url_or_path: str, headers: Dict | None = None, timeout: int = 10) -> Dict:
+    """Extract duration and ID3/metadata tags from a media file using ffprobe."""
+    result = {"duration": None, "title": None, "artist": None, "album": None, "has_cover": False}
+    try:
+        hdr_str = None
+        if headers:
+            hdr_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration:format_tags=title,artist,album,album_artist:stream=index,codec_type:stream_disposition=attached_pic",
+            "-of", "json"
+        ]
+        if hdr_str:
+            cmd += ["-headers", hdr_str]
+        cmd.append(url_or_path)
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=timeout)
+        data = json.loads(out.stdout or b"{}")
+        
+        fmt = data.get("format", {})
+        dur = fmt.get("duration")
+        if dur is not None:
+            result["duration"] = int(float(dur))
+        
+        tags = fmt.get("tags", {})
+        # ID3 tags can be case-insensitive, so check common variations
+        result["title"] = tags.get("title") or tags.get("TITLE")
+        result["artist"] = tags.get("artist") or tags.get("ARTIST") or tags.get("album_artist") or tags.get("ALBUM_ARTIST")
+        result["album"] = tags.get("album") or tags.get("ALBUM")
+        
+        # Check for embedded cover art (attached_pic stream)
+        streams = data.get("streams", [])
+        for stream in streams:
+            if stream.get("disposition", {}).get("attached_pic") == 1:
+                result["has_cover"] = True
+                break
+    except Exception:
+        pass
+    return result
+
+def _extract_embedded_cover(url_or_path: str, output_dir: str = "images", timeout: int = 15) -> Optional[str]:
+    """Extract embedded album art from a media file using ffmpeg."""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        # Generate a unique filename based on the source path/url
+        import hashlib
+        url_hash = hashlib.md5(url_or_path.encode()).hexdigest()[:12]
+        output_path = os.path.join(output_dir, f"cover_{url_hash}.jpg")
+        
+        # Skip if already extracted
+        if os.path.exists(output_path):
+            return output_path
+        
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", url_or_path,
+            "-an",  # No audio
+            "-vcodec", "mjpeg",  # Output as JPEG
+            "-frames:v", "1",  # Only one frame (the cover)
+            output_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=timeout)
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return output_path
+    except Exception:
+        pass
+    return None
+
 def _yt_dlp_probe_duration(audio_url: str) -> Optional[int]:
     try:
         import yt_dlp
@@ -80,6 +156,63 @@ def _normalize_suno_short(url: str) -> str:
     except Exception:
         pass
     return url
+
+# =========================
+# Direct media URL detection
+# =========================
+
+def _is_direct_media_url(url: str) -> bool:
+    """Check if URL appears to be a direct media file."""
+    # Common audio/video extensions
+    media_extensions = (
+        '.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.opus',
+        '.mp4', '.webm', '.mkv', '.avi', '.mov'
+    )
+    parsed = urllib.parse.urlparse(url.lower())
+    path = parsed.path
+    return any(path.endswith(ext) for ext in media_extensions)
+
+def _extract_direct_media_info(url: str) -> dict:
+    """Extract info from a direct audio/video URL."""
+    # Extract filename from URL for fallback title
+    parsed = urllib.parse.urlparse(url)
+    filename = os.path.basename(parsed.path)
+    fallback_title = os.path.splitext(filename)[0] or "Direct Audio"
+    # URL decode the title to handle percent-encoded characters
+    fallback_title = urllib.parse.unquote(fallback_title)
+    
+    # Probe metadata (duration, title, artist, album, has_cover) with ffprobe
+    metadata = _ffprobe_metadata(url)
+    
+    # Use metadata title if available, otherwise fall back to filename
+    title = metadata.get("title") or fallback_title
+    artist = metadata.get("artist")
+    duration = metadata.get("duration")
+    
+    # Extract embedded cover art if available
+    local_thumbnail = None
+    if metadata.get("has_cover"):
+        local_thumbnail = _extract_embedded_cover(url)
+    
+    return {
+        "title": title,
+        "url": url,
+        "duration": duration,
+        "date": None,
+        "artist": artist,
+        "suno_url": None,
+        "thumbnail": None,
+        "local_thumbnail": local_thumbnail,
+        "video_url": None,
+        "prompt": None,
+        "lyrics": None,
+        "image_url": None,
+        "major_model_version": None,
+        "model_name": None,
+        "play_count": None,
+        "like_count": None,
+        "created_at": None,
+    }
 
 # =========================
 # Static (requests + BS4 + JSON scraping)
@@ -144,6 +277,11 @@ def _extract_audio_url_from_meta_or_html(soup: BeautifulSoup, raw_html: str, son
 def extract_song_info(url: str) -> dict:
     """Extract rich song metadata and a playable audio URL, Playwright-free."""
     os.makedirs("songs", exist_ok=True)
+    
+    # Handle direct media URLs first (mp3, wav, ogg, m4a, flac, mp4, webm, etc.)
+    if _is_direct_media_url(url):
+        return _extract_direct_media_info(url)
+    
     url = _normalize_suno_short(url)
 
     # Prefer Suno page path
@@ -224,10 +362,11 @@ def extract_song_info(url: str) -> dict:
             video_url = extract_video_url(soup, raw_html)
             
             # Extract additional information
-            image_url = extract_image_url(soup)
-            model_info = extract_model_info(soup)
-            play_count = extract_play_count(soup)
-            like_count = extract_like_count(soup)
+            image_url = extract_image_url(soup, raw_html)
+            model_info = extract_model_info(soup, raw_html)
+            play_count = extract_play_count(soup, raw_html)
+            like_count = extract_like_count(soup, raw_html)
+            created_at = extract_created_at(soup, raw_html)
 
             # Audio URL (meta -> html regex -> construct)
             audio_url = _extract_audio_url_from_meta_or_html(soup, raw_html, song_id)
@@ -251,6 +390,18 @@ def extract_song_info(url: str) -> dict:
                 except Exception:
                     duration = None
 
+            # Download and cache the thumbnail image locally
+            local_thumbnail = None
+            if thumbnail:
+                try:
+                    local_thumbnail = download_image(
+                        thumbnail,
+                        song_id=song_id,
+                        referer=f"https://suno.com/song/{song_id}" if song_id else "https://suno.com/"
+                    )
+                except Exception:
+                    pass  # Fallback to external URL if download fails
+
             return {
                 "title": title,
                 "url": audio_url,
@@ -259,6 +410,7 @@ def extract_song_info(url: str) -> dict:
                 "artist": artist,
                 "suno_url": f"https://suno.com/song/{song_id}" if song_id else url,
                 "thumbnail": thumbnail,
+                "local_thumbnail": local_thumbnail,  # New field for cached image
                 "video_url": video_url,
                 "prompt": prompt,
                 "lyrics": lyrics,
@@ -267,11 +419,19 @@ def extract_song_info(url: str) -> dict:
                 "model_name": model_info.get("model_name"),
                 "play_count": play_count,
                 "like_count": like_count,
+                "created_at": created_at,
             }
 
         except Exception as e:
             print(f"Suno direct extraction failed: {e}")
             raise  # Re-raise the exception so it can be handled by the caller
     
-    # If URL doesn't match suno.com/song/, raise an error
+    # Try yt-dlp for other platforms (SoundCloud, Bandcamp, Mixcloud, etc.)
+    if is_ytdlp_supported_url(url):
+        result = extract_with_ytdlp(url)
+        if result:
+            return result
+        # If yt-dlp extraction failed, fall through to error
+    
+    # If nothing worked, raise an error
     raise ValueError(f"Unsupported URL format: {url}")

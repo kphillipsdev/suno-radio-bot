@@ -15,11 +15,20 @@ from pathlib import Path
 from discord.utils import escape_markdown
 from src.data.persistence import load_data, save_data
 from src.utils.extractor import extract_song_info
-from src.utils.song_list_scraper import scrape_suno_songs
+from src.utils.playlist_fast_scraper import get_playlist_links_api
 from src.utils.prefetch import prefetch_to_file
-from src.data.db import like_track, unlike_track, get_like_count, get_user_like_count, top_liked_for_users
+from src.data.db import like_track, unlike_track, get_like_count, get_user_like_count, top_liked_for_users, get_user_liked_tracks_all_guilds, get_conn, recent_plays
 from src.utils.shuffle_displacing_first import shuffle_displacing_first_inplace
+try:
+    from src.utils.image_cache import cache_song_image, get_default_image_path
+except ImportError:
+    # Fallback if import fails (e.g., during reload)
+    from src.utils import image_cache
+    cache_song_image = image_cache.cache_song_image
+    get_default_image_path = image_cache.get_default_image_path
 from src.ui.queue_manager import QueueManagerView, build_queue_embed
+from src.ui.pagination import PaginatedView
+from src.ui.liked_songs_manager import LikedSongsManagerView
 
 # === Play history DB (safe if module not present) ===========================
 try:
@@ -30,16 +39,30 @@ except Exception:
     def log_play_end(**kwargs): return None
 
 # ===== Embed + Formatting Helpers ===========================================
-EMBED_COLOR_PLAYING = 0x580fd6
+EMBED_COLOR_PLAYING = 0x580fd6  # Purple (default/Suno)
 EMBED_COLOR_ADDED   = 0xc1d4d6
 
+# Platform-specific colors for Now Playing embeds
+PLATFORM_COLORS = {
+    "suno": 0xFD429C,       # Pink (Suno brand) - rgb(253, 66, 156)
+    "soundcloud": 0xFF5500, # Orange (SoundCloud brand)
+    "bandcamp": 0x1DA0C3,   # Teal/Cyan (Bandcamp brand)
+    "mixcloud": 0x5000FF,   # Purple (Mixcloud brand)
+    "audiomack": 0xFFA200,  # Orange/Gold (Audiomack brand)
+    "direct": 0x2DD4BF,     # Teal (direct MP3/files)
+    "default": 0x580fd6,    # Purple (fallback)
+}
+
+# Discord file upload limit (8MB for regular servers, using 7MB to be safe)
+MAX_THUMBNAIL_SIZE_BYTES = 7 * 1024 * 1024  # 7MB
+
 # Commands whose *text* messages should be auto-deleted after successful run
-AUTO_DELETE_COMMANDS: set[str] = {"skip", "stop", "top", "history", "queue", "remove", "join" ,"leave"}
+AUTO_DELETE_COMMANDS: set[str] = {"skip", "stop", "top", "history", "queue", "remove", "join" ,"leave", "autofill_saves"}
 
 # ---- Prefetch config (env-driven) ------------------------------------------
 PREFETCH_MODE    = os.getenv("PREFETCH_MODE", "full").lower()  # "none" | "warmup" | "full"
 PREFETCH_BYTES   = int(os.getenv("PREFETCH_BYTES", "524288"))    # ~512 KB for warmup
-PREFETCH_TIMEOUT = int(os.getenv("PREFETCH_TIMEOUT", "25"))      # seconds
+PREFETCH_TIMEOUT = int(os.getenv("PREFETCH_TIMEOUT", "60"))      # seconds
 PREFETCH_DIR     = os.getenv("PREFETCH_DIR", "songs") or "songs"
 
 # ---- Startup polish & FFmpeg tuning --------------------------------------
@@ -76,12 +99,13 @@ SHOW_SKIP_MESSAGE = os.getenv("SHOW_SKIP_MESSAGE", "1") == "1"
 
 # ---- Queue add limit (peak throttle) ---------------------------------------
 QUEUE_LIMIT_DEFAULT_ENABLED = os.getenv("QUEUE_LIMIT_DEFAULT_ENABLED", "1") == "1"
-QUEUE_LIMIT_MAX_PER_ADD     = int(os.getenv("QUEUE_LIMIT_MAX_PER_ADD", "25"))  # default cap
+QUEUE_LIMIT_MAX_PER_ADD     = int(os.getenv("QUEUE_LIMIT_MAX_PER_ADD", "200"))  # default cap
 QUEUE_MAX_PER_USER          = int(os.getenv("QUEUE_MAX_PER_USER", "3"))        # hard cap per user in queue
 
-# ---- Now Playing pruning (autofill-only) -----------------------------------
-# Only prune NP cards that came from autofill tracks, once N subsequent songs have started.
-REMOVE_NP_AFTER_SONGS = int(os.getenv("REMOVE_NP_AFTER_SONGS", "2"))  # default=2 songs
+# ---- Now Playing pruning ---------------------------------------------------
+# Prune NP cards once N subsequent songs have started.
+REMOVE_NP_AFTER_SONGS = int(os.getenv("REMOVE_NP_AFTER_SONGS", "1"))  # default=1 song
+REMOVE_NON_AUTOFILL_NP = os.getenv("REMOVE_NON_AUTOFILL_NP", "0") == "1"  # default=stay (False)
 
 async def maybe_prefetch(song: dict) -> str | None:
     """
@@ -95,6 +119,15 @@ async def maybe_prefetch(song: dict) -> str | None:
     url = str(song.get("url") or "").strip()
     if not url or url.startswith("songs/"):
         return None  # already local or no url
+
+    # Skip prefetch for yt-dlp sources (SoundCloud, Bandcamp, etc.)
+    # These often use HLS streams or expiring URLs that can't be prefetched
+    if song.get("_source"):
+        return None
+
+    # Skip prefetch for HLS/m3u8 streams (can't download as single file)
+    if ".m3u8" in url or "/hls" in url.lower():
+        return None
 
     referer = song.get("suno_url") or "https://suno.com/"
     loop = asyncio.get_running_loop()
@@ -176,6 +209,63 @@ def _truncate(text: str | None, limit: int = 300) -> str:
     t = text.strip()
     return t if len(t) <= limit else (t[:limit - 1] + "…")
 
+def _get_platform_color(track: dict) -> int:
+    """Get the embed color based on the track's source platform."""
+    source = (track.get("_source") or "").lower()
+    url = (track.get("url") or "").lower()
+    suno_url = track.get("suno_url") or ""
+    
+    # Check _source field first (for yt-dlp sourced tracks)
+    if source:
+        if "soundcloud" in source:
+            return PLATFORM_COLORS["soundcloud"]
+        if "bandcamp" in source:
+            return PLATFORM_COLORS["bandcamp"]
+        if "mixcloud" in source:
+            return PLATFORM_COLORS["mixcloud"]
+        if "audiomack" in source:
+            return PLATFORM_COLORS["audiomack"]
+        # Other yt-dlp sources get the direct/teal color
+        return PLATFORM_COLORS["direct"]
+    
+    # Check if it's a Suno track (CDN URLs, suno_url field, or local prefetched files)
+    if "suno.ai" in url or "suno.com" in url or "suno.com" in suno_url:
+        return PLATFORM_COLORS["suno"]
+    
+    # Check for prefetched Suno files (songs/*.mp3 from Suno CDN)
+    if url.startswith("songs/") or url.startswith("/") and "/songs/" in url:
+        return PLATFORM_COLORS["suno"]
+    
+    # Check URL for direct media files (non-Suno)
+    if url.endswith((".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus")):
+        return PLATFORM_COLORS["direct"]
+    
+    # Default to Suno color (most tracks are Suno)
+    return PLATFORM_COLORS["suno"]
+
+def _get_platform_name(url: str) -> str:
+    """Get a friendly platform name from a URL for button labels."""
+    if not url:
+        return "Source"
+    url_lower = url.lower()
+    if "suno.com" in url_lower:
+        return "Suno"
+    if "soundcloud.com" in url_lower:
+        return "SoundCloud"
+    if "bandcamp.com" in url_lower:
+        return "Bandcamp"
+    if "mixcloud.com" in url_lower:
+        return "Mixcloud"
+    if "audiomack.com" in url_lower:
+        return "Audiomack"
+    if "audius.co" in url_lower:
+        return "Audius"
+    if "hearthis.at" in url_lower:
+        return "Hearthis"
+    if "newgrounds.com" in url_lower:
+        return "Newgrounds"
+    return "Source"
+
 def _derive_suno_url(track: dict) -> str | None:
     """
     Prefer explicit 'suno_url', else derive from known Suno CDN or local cache paths.
@@ -222,11 +312,41 @@ def _canonical_track_id(track: dict) -> str | None:
 
     return None
 
+def _scrape_playlist_to_tracks(playlist_url: str, limit: int = 0) -> list[dict]:
+    """
+    Scrape a Suno playlist using the fast API and convert URLs to track dict format.
+    Returns list of dicts with 'url' and 'suno_url' fields compatible with _resolve_tracks().
+    """
+    if not playlist_url or not playlist_url.strip():
+        return []
+    
+    try:
+        urls = get_playlist_links_api(playlist_url.strip())
+        if limit > 0:
+            urls = urls[:limit]
+        return [{"url": url, "suno_url": url} for url in urls]
+    except Exception as e:
+        print(f"[playlist scraper] Error scraping playlist {playlist_url}: {e}")
+        return []
+
 def _track_title_link(track: dict) -> str:
     title = escape_markdown((track.get("title") or "Untitled").strip())
-    link  = _derive_suno_url(track) or (track.get("url") or "").strip()
-    # Only link if it's a Suno/page URL; avoid deep linking raw audio if ugly
-    if link and ("suno.com" in link):
+    
+    # Try to get a linkable URL (prefer page URLs over raw audio URLs)
+    link = None
+    
+    # 1. For yt-dlp sources (SoundCloud, Bandcamp, etc.), use the original page URL
+    if track.get("_original_url"):
+        link = track["_original_url"]
+    # 2. For yt-dlp sources, video_url also contains the page URL
+    elif track.get("video_url") and not track.get("video_url", "").endswith((".mp3", ".mp4", ".webm")):
+        link = track["video_url"]
+    # 3. For Suno tracks, derive the suno.com URL
+    elif _derive_suno_url(track):
+        link = _derive_suno_url(track)
+    
+    # Only link if it's a proper page URL (not raw audio)
+    if link and any(domain in link for domain in ("suno.com", "soundcloud.com", "bandcamp.com", "mixcloud.com", "audiomack.com", "audius.co", "hearthis.at", "newgrounds.com")):
         return f"[**{title}**]({link})"
     return f"**{title}**"
 
@@ -247,10 +367,58 @@ def _prompt_text(track: dict) -> str:
     return _truncate(prompt, 300)
 
 def _thumb(track: dict) -> str | None:
-    return track.get("thumbnail") or track.get("thumb") or track.get("image")
+    """Get thumbnail URL for external URLs (fallback). Use _get_thumbnail_info for local files."""
+    url = track.get("thumbnail") or track.get("thumb") or track.get("image") or track.get("image_url")
+    if not url or not isinstance(url, str) or not url.startswith("http"):
+        return url
+    buster = f"v={int(time.time())}"
+    return f"{url}&{buster}" if "?" in url else f"{url}?{buster}"
 
-def _video_url(track: dict) -> str | None:
-    return track.get("video_url") or track.get("video")
+
+def _get_thumbnail_info(track: dict) -> tuple[str | None, str | None]:
+    """
+    Get thumbnail info for a track, preferring local cached images.
+    Falls back to default image if no thumbnail is available.
+    
+    Returns:
+        tuple of (thumbnail_url, local_file_path)
+        - If local file exists: ("attachment://filename.ext", "/path/to/file.ext")
+        - If only external URL: ("https://...", None)
+        - If no thumbnail but default exists: ("attachment://default.jpg", "/path/to/default.jpg")
+        - If nothing available: (None, None)
+    """
+    # Check for local thumbnail first (most reliable)
+    local_path = track.get("local_thumbnail")
+    if local_path and os.path.exists(local_path):
+        filename = os.path.basename(local_path)
+        return f"attachment://{filename}", local_path
+    
+    # Try to cache if we have a thumbnail URL but no local copy
+    thumb_url = track.get("thumbnail") or track.get("thumb") or track.get("image") or track.get("image_url")
+    if thumb_url and isinstance(thumb_url, str) and thumb_url.startswith("http"):
+        # Try to cache the image (will return default on failure)
+        try:
+            local_path = cache_song_image(track, use_default_on_fail=True)
+            if local_path and os.path.exists(local_path):
+                # Update track dict for future use
+                track["local_thumbnail"] = local_path
+                filename = os.path.basename(local_path)
+                return f"attachment://{filename}", local_path
+        except Exception:
+            pass
+        
+        # Fallback to external URL with cache-buster
+        buster = f"v={int(time.time())}"
+        url_with_buster = f"{thumb_url}&{buster}" if "?" in thumb_url else f"{thumb_url}?{buster}"
+        return url_with_buster, None
+    
+    # No thumbnail URL - use default image if available
+    default_path = get_default_image_path()
+    if default_path and os.path.exists(default_path):
+        filename = os.path.basename(default_path)
+        return f"attachment://{filename}", default_path
+    
+    return None, None
 
 def _format_upcoming_list(tracks: list[dict], limit: int = 2) -> str:
     if not tracks:
@@ -303,16 +471,24 @@ def _chunk_text(s: str | None, limit: int = 3900) -> list[str]:
         out.append(remaining)
     return out
 
-def build_now_playing_embed(track: dict, requester_mention: str | None, upcoming_tracks: list[dict] | None = None):
+def build_now_playing_embed(track: dict, requester_mention: str | None, upcoming_tracks: list[dict] | None = None) -> tuple[discord.Embed, discord.File | None]:
+    """
+    Build the now playing embed with optional local thumbnail file.
+    
+    Returns:
+        tuple of (embed, file) where file is a discord.File if using local thumbnail, else None
+    """
     desc = [
         _track_title_link(track) + _filler_badge(track),
         _artist_line(track),
         ""
     ]
+    # Use platform-specific color (Suno=pink, SoundCloud=orange, etc.)
+    embed_color = _get_platform_color(track)
     embed = discord.Embed(
         title="🎵 Now Playing",
         description="\n".join(desc),
-        color=EMBED_COLOR_PLAYING
+        color=embed_color
     )
     embed.add_field(name="Duration", value=_fmt_duration(track.get("duration")), inline=True)
 
@@ -327,18 +503,32 @@ def build_now_playing_embed(track: dict, requester_mention: str | None, upcoming
             inline=False
         )
 
-    thumb = _thumb(track)
-    if thumb:
-        embed.set_thumbnail(url=thumb)
-
-    video = _video_url(track)
-    if video:
-        # Try using set_image for video - Discord may display it as a video preview
-        embed.set_image(url=video)
+    # Get thumbnail info (prefers local cached images)
+    thumb_file = None
+    thumb_url, local_path = _get_thumbnail_info(track)
+    if thumb_url:
+        embed.set_thumbnail(url=thumb_url)
+        if local_path:
+            try:
+                # Check file size before uploading (Discord has 8MB limit)
+                file_size = os.path.getsize(local_path)
+                if file_size <= MAX_THUMBNAIL_SIZE_BYTES:
+                    thumb_file = discord.File(local_path, filename=os.path.basename(local_path))
+                else:
+                    # File too large, use external URL instead
+                    print(f"[thumbnail] Skipping local file ({file_size / 1024 / 1024:.1f}MB > 7MB limit): {local_path}")
+                    fallback_thumb = _thumb(track)
+                    if fallback_thumb:
+                        embed.set_thumbnail(url=fallback_thumb)
+            except Exception:
+                # Fallback to external URL if file creation fails
+                fallback_thumb = _thumb(track)
+                if fallback_thumb:
+                    embed.set_thumbnail(url=fallback_thumb)
 
     embed.set_footer(text="Suno Radio")
     embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
-    return embed
+    return embed, thumb_file
 
 def build_added_embed(
     track: dict,
@@ -346,20 +536,25 @@ def build_added_embed(
     position: int | None = None,
     eta_seconds: int | None = None,
     eta_unknown: bool = False
-):
+) -> tuple[discord.Embed, discord.File | None]:
     """
     Added card: heading = song title (clickable), body = artist,
     fields = Duration, Requested by (with original request time), Position (+ ETA).
+    
+    Returns:
+        tuple of (embed, file) where file is a discord.File if using local thumbnail, else None
     """
     desc = [
         _track_title_link(track) + _filler_badge(track),
         _artist_line(track),
         ""
     ]
+    # Use platform-specific color (Suno=pink, SoundCloud=orange, etc.)
+    embed_color = _get_platform_color(track)
     embed = discord.Embed(
         title="➕ Added",
         description="\n".join([s for s in desc if s is not None]),
-        color=EMBED_COLOR_ADDED
+        color=embed_color
     )
     embed.add_field(name="Duration", value=_fmt_duration(track.get("duration")), inline=True)
 
@@ -377,11 +572,30 @@ def build_added_embed(
         pos_val = f"#{position}" + (f" (Up in ~{eta_label})" if eta_label else "")
         embed.add_field(name="Position", value=pos_val, inline=False)
 
-    thumb = _thumb(track)
-    if thumb:
-        embed.set_thumbnail(url=thumb)
+    # Get thumbnail info (prefers local cached images)
+    thumb_file = None
+    thumb_url, local_path = _get_thumbnail_info(track)
+    if thumb_url:
+        embed.set_thumbnail(url=thumb_url)
+        if local_path:
+            try:
+                # Check file size before uploading (Discord has 8MB limit)
+                file_size = os.path.getsize(local_path)
+                if file_size <= MAX_THUMBNAIL_SIZE_BYTES:
+                    thumb_file = discord.File(local_path, filename=os.path.basename(local_path))
+                else:
+                    # File too large, use external URL instead
+                    print(f"[thumbnail] Skipping local file ({file_size / 1024 / 1024:.1f}MB > 7MB limit): {local_path}")
+                    fallback_thumb = _thumb(track)
+                    if fallback_thumb:
+                        embed.set_thumbnail(url=fallback_thumb)
+            except Exception:
+                # Fallback to external URL if file creation fails
+                fallback_thumb = _thumb(track)
+                if fallback_thumb:
+                    embed.set_thumbnail(url=fallback_thumb)
 
-    return embed
+    return embed, thumb_file
 
 # ---- Song Info helpers (module scope) --------------------------------------
 def _render_song_header(song: dict) -> str:
@@ -403,18 +617,38 @@ def _render_song_header(song: dict) -> str:
     
     parts = [title_md, byline_md]
     
-    # Add model version/name
+    # Build date + model line together: "August 17, 2025 at 12:01 AM (V 3.5 chirp-chirp)"
+    date_model_parts = []
+    
+    # Add created date (date only, no time since it's timezone dependent)
+    created_at = song.get("created_at")
+    if created_at:
+        try:
+            from datetime import datetime
+            # Parse ISO format: "2025-08-17T04:01:25.427Z"
+            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            # Format as "August 17, 2025"
+            formatted_date = dt.strftime("%B %d, %Y").replace(" 0", " ")
+            date_model_parts.append(formatted_date)
+        except (ValueError, AttributeError):
+            pass  # Skip if date parsing fails
+    
+    # Add model version/name in parentheses
     model_version = song.get("major_model_version")
     model_name = song.get("model_name")
     if model_version or model_name:
-        model_line = model_version or ""
+        model_parts = []
+        if model_version:
+            # Format as "v3.5" - lowercase v, no space
+            v = model_version.lstrip('vV')  # Remove leading v/V
+            model_parts.append(f"v{v}")
         if model_name:
-            if model_line:
-                model_line = f"{model_line} ({model_name})"
-            else:
-                model_line = model_name
-        if model_line:
-            parts.append(model_line)
+            model_parts.append(model_name)
+        if model_parts:
+            date_model_parts.append(f"({' '.join(model_parts)})")
+    
+    if date_model_parts:
+        parts.append(" ".join(date_model_parts))
     
     # Add stats
     play_count = song.get("play_count")
@@ -422,9 +656,9 @@ def _render_song_header(song: dict) -> str:
     if play_count is not None or like_count is not None:
         stats_parts = []
         if play_count is not None:
-            stats_parts.append(f"{play_count:,} plays")
+            stats_parts.append(f"{play_count:,} Plays")
         if like_count is not None:
-            stats_parts.append(f"{like_count:,} likes")
+            stats_parts.append(f"{like_count:,} Likes")
         if stats_parts:
             parts.append(" / ".join(stats_parts))
     
@@ -444,10 +678,13 @@ def _render_prompt_lyrics_block(song: dict) -> str:
 
     return "\n".join(parts).strip()
 
-def build_song_info_embed(song: dict) -> discord.Embed:
+def build_song_info_embed(song: dict) -> tuple[discord.Embed, discord.File | None]:
     """
     Build the song info embed (same as song_info command).
     Used for displaying lyrics and prompt information.
+    
+    Returns:
+        tuple of (embed, file) where file is a discord.File if using local thumbnail, else None
     """
     song = song.copy()
     
@@ -507,14 +744,23 @@ def build_song_info_embed(song: dict) -> discord.Embed:
     if duration:
         embed.add_field(name="Duration", value=_fmt_duration(duration), inline=True)
     
-    # Add thumbnail if available
-    thumb = _thumb(song)
-    if thumb:
-        embed.set_thumbnail(url=thumb)
+    # Get thumbnail info (prefers local cached images)
+    thumb_file = None
+    thumb_url, local_path = _get_thumbnail_info(song)
+    if thumb_url:
+        embed.set_thumbnail(url=thumb_url)
+        if local_path:
+            try:
+                thumb_file = discord.File(local_path, filename=os.path.basename(local_path))
+            except Exception:
+                # Fallback to external URL if file creation fails
+                fallback_thumb = _thumb(song)
+                if fallback_thumb:
+                    embed.set_thumbnail(url=fallback_thumb)
     
     embed.set_footer(text="Suno Radio")
     embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
-    return embed
+    return embed, thumb_file
 
 # ---------------------------------------------------------------------------
 
@@ -641,7 +887,8 @@ class LikeView(discord.ui.View):
 
             if self.song_url.startswith("http"):
                 link_view = discord.ui.View()
-                link_view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=self.song_url, label="Open on Suno"))
+                platform_name = _get_platform_name(self.song_url)
+                link_view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=self.song_url, label=f"Open on {platform_name}"))
                 await interaction.followup.send(msg, view=link_view, ephemeral=True)
             else:
                 await interaction.followup.send(msg, ephemeral=True)
@@ -668,8 +915,11 @@ class LyricsButton(discord.ui.Button):
             return await interaction.response.defer(ephemeral=True)
         
         try:
-            embed = build_song_info_embed(self.song)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed, thumb_file = build_song_info_embed(self.song)
+            if thumb_file:
+                await interaction.response.send_message(embed=embed, file=thumb_file, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
         except Exception as e:
             try:
                 await interaction.response.send_message(
@@ -783,7 +1033,8 @@ class LikeButton(discord.ui.Button):
             
             if self.song_url.startswith("http"):
                 link_view = discord.ui.View()
-                link_view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=self.song_url, label="Open on Suno"))
+                platform_name = _get_platform_name(self.song_url)
+                link_view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=self.song_url, label=f"Open on {platform_name}"))
                 await interaction.followup.send(msg, view=link_view, ephemeral=True)
             else:
                 await interaction.followup.send(msg, ephemeral=True)
@@ -820,8 +1071,11 @@ class NowPlayingView(discord.ui.View):
         self.song_url = (song_url or "").strip()
         self.user_clicked = set()
         
-        # Add like button if track_id is provided
-        if track_id and guild_id and bot_user_id:
+        # Add like button if track_id is provided AND it's a Suno track
+        # Hide for external sources (SoundCloud, Bandcamp, direct URLs) since they can't be used in autofill
+        is_external_source = bool(song.get("_source"))  # yt-dlp sourced tracks have _source
+        
+        if track_id and guild_id and bot_user_id and not is_external_source:
             like_btn = LikeButton(
                 track_id=track_id,
                 guild_id=guild_id,
@@ -831,9 +1085,94 @@ class NowPlayingView(discord.ui.View):
             )
             self.add_item(like_btn)
         
-        # Always add lyrics/prompt button
-        lyrics_btn = LyricsButton(song=self.song)
-        self.add_item(lyrics_btn)
+        # Add lyrics/prompt button only for Suno tracks (external sources don't have this metadata)
+        if not is_external_source:
+            lyrics_btn = LyricsButton(song=self.song)
+            self.add_item(lyrics_btn)
+
+
+class PaginatedQueueView(PaginatedView):
+    """
+    Paginated view for queue display with Previous/Next navigation.
+    """
+    
+    def __init__(
+        self,
+        *,
+        queue: deque,
+        eta_list: list[int | None],
+        timeout: float | None = 300.0,
+    ):
+        self.queue = queue
+        self.eta_list = eta_list
+        super().__init__(
+            total_items=len(queue),
+            items_per_page=12,
+            timeout=timeout,
+        )
+    
+    def _build_embed(self) -> discord.Embed:
+        """Build the embed for the current page."""
+        queue_list = list(self.queue)
+        total_items = len(queue_list)
+        
+        if total_items == 0:
+            return discord.Embed(
+                title="📋 Queue",
+                description="Queue is empty! Add songs with `!play`.",
+                color=0x0099ff
+            )
+        
+        # Calculate start and end indices for current page
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, total_items)
+        
+        lines = []
+        for i in range(start_idx, end_idx):
+            song = queue_list[i]
+            song_num = i + 1
+            eta_sec = self.eta_list[i] if i < len(self.eta_list) else None
+            
+            title_link = _track_title_link(song) + _filler_badge(song)
+            artist_raw = (song.get("artist") or song.get("author") or "Unknown Artist").strip()
+            artist = escape_markdown(artist_raw)
+            requester = (
+                song.get("requester_mention")
+                or (f"<@{song['requester_id']}>" if song.get("requester_id") else None)
+                or song.get("requester_tag")
+                or song.get("requester_name")
+                or ""
+            )
+            
+            if eta_sec is None:
+                eta_str = "≈unknown"
+            else:
+                eta_str = _fmt_duration(max(0, int(eta_sec)))
+            
+            lines.append(
+                f"**{song_num}.** {title_link} by {artist}\n"
+                f"   Up in ~{eta_str} / Requested by {requester}"
+            )
+        
+        description = "\n".join(lines) if lines else "No items on this page."
+        
+        embed = discord.Embed(
+            title="📋 Current Queue",
+            description=description,
+            color=0x0099ff
+        )
+        
+        # Add footer with page info
+        if self.total_pages > 1:
+            embed.set_footer(
+                text=f"Page {self.current_page + 1} of {self.total_pages} • "
+                     f"Showing items {start_idx + 1}-{end_idx} of {total_items}"
+            )
+        else:
+            embed.set_footer(text=f"Total: {total_items} item{'s' if total_items != 1 else ''}")
+        
+        return embed
+
 
 # ===== Music Cog =============================================================
 class RadioBot(commands.Cog):
@@ -860,13 +1199,21 @@ class RadioBot(commands.Cog):
         # --- Playback overlap guard (fixes double-play jitter) -----------------
         self._play_locks = defaultdict(asyncio.Lock)
 
-        # --- Now Playing tracking for pruning (autofill only) -----------------
+        # --- Now Playing tracking for pruning ----------------------------------
         self._song_index = defaultdict(int)
         self._np_track = defaultdict(list)
         self._np_retention_n = REMOVE_NP_AFTER_SONGS
 
         # --- QPanel message tracking (for cleanup) -----------------------------
         self._qpanel_messages = {}  # guild_id -> discord.Message
+        
+        # --- Autofill saves DM message tracking (for cleanup) -------------------
+        self._autofill_dm_messages = {}  # user_id -> discord.Message
+
+        self.np_clean_non_autofill = {} # guild_id -> bool
+
+        # --- Autofill queue recalculation debouncing ----------------------------
+        self._autofill_recalc_timers = {}  # guild_id -> asyncio.Task for debouncing
 
     def _is_admin(self, member: discord.Member) -> bool:
         """Admins bypass queue limitations."""
@@ -1158,57 +1505,80 @@ class RadioBot(commands.Cog):
             return []
 
         try:
-            rows = top_liked_for_users(
+            # Get all liked songs with aggregate like counts (high limit for weighted selection)
+            all_songs = top_liked_for_users(
                 guild_id=gid,
                 user_ids=user_ids,
-                limit=AUTOFILL_MAX_PULL * max(1, AUTOFILL_LIKES_PER_USER),
+                limit=1000,  # High limit to get all available songs for weighted selection
             )
         except Exception as e:
             print(f"[autofill likes] failed to fetch liked tracks: {e}")
             return []
 
-        by_user: dict[int, list[dict]] = defaultdict(list)
-        for r in rows:
-            uid = r.get("user_id") or r.get("liked_by") or r.get("user")
-            if uid is None:
-                continue
-            try:
-                uid_int = int(uid)
-            except (TypeError, ValueError):
-                continue
-            by_user[uid_int].append(r)
+        if not all_songs:
+            return []
 
+        # Extract weights (like counts) - minimum weight of 1 ensures all songs are selectable
+        weights = [max(1, song.get("like_count", 1)) for song in all_songs]
+
+        # Weighted random selection - select up to AUTOFILL_MAX_PULL
+        selected_count = min(AUTOFILL_MAX_PULL, len(all_songs))
+        selected = random.choices(all_songs, weights=weights, k=selected_count)
+
+        # Convert to expected format and deduplicate by URL
+        seen_urls = set()
         raw: list[dict] = []
-        per_user_cap = max(1, AUTOFILL_LIKES_PER_USER)
-        for uid in user_ids:
-            user_rows = by_user.get(uid, [])
-            if not user_rows:
+        for song in selected:
+            url = (song.get("source_url") or "").strip()
+            if not url:
                 continue
-
-            random.shuffle(user_rows)
-            pick = user_rows[:per_user_cap]
-
-            for r in pick:
-                url = (r.get("source_url") or "").strip()
-                if not url:
-                    continue
-                raw.append(
-                    {
-                        "id": r.get("track_id"),
-                        "url": url,
-                        "suno_url": url,
-                        "_liked_weight": r.get("like_count", 0),
-                    }
-                )
-
-        if len(raw) > AUTOFILL_MAX_PULL:
-            random.shuffle(raw)
-            raw = raw[:AUTOFILL_MAX_PULL]
+            if url in seen_urls:
+                continue  # Skip duplicates
+            seen_urls.add(url)
+            raw.append(
+                {
+                    "id": song.get("track_id"),
+                    "url": url,
+                    "suno_url": url,
+                    "_liked_weight": song.get("like_count", 0),
+                }
+            )
 
         return raw
 
+    def _apply_recently_played_guard(self, gid: int, tracks: list[dict]) -> list[dict]:
+        """
+        Reorder tracks so recently played songs (last 10) are moved to the end.
+        The recently played portion is shuffled before appending.
+        """
+        try:
+            recent = recent_plays(guild_id=gid, limit=10, include_autofill=True)
+            recent_track_ids = {str(r["track_id"]) for r in recent if r.get("track_id")}
+        except Exception:
+            return tracks  # If query fails, return unchanged
+        
+        if not recent_track_ids:
+            return tracks
+        
+        not_recent = []
+        recently_played = []
+        
+        for t in tracks:
+            track_id = _canonical_track_id(t)
+            if track_id and track_id in recent_track_ids:
+                recently_played.append(t)
+            else:
+                not_recent.append(t)
+        
+        # Shuffle the recently played list before appending
+        random.shuffle(recently_played)
+        
+        return not_recent + recently_played
+
     async def _enqueue_autofill_batch(self, ctx, gid: int):
         liked_raw = await self._get_autofill_liked_raw(ctx, gid)
+        # Shuffle the liked songs separately (after weighted selection)
+        random.shuffle(liked_raw)
         liked_raw = liked_raw[:AUTOFILL_MAX_PULL]
         remaining = max(0, AUTOFILL_MAX_PULL - len(liked_raw))
 
@@ -1218,15 +1588,17 @@ class RadioBot(commands.Cog):
         if remaining > 0:
             if url:
                 raw_from_url = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: scrape_suno_songs(url, limit=AUTOFILL_MAX_PULL)
+                    None, lambda: _scrape_playlist_to_tracks(url, limit=AUTOFILL_MAX_PULL)
                 )
                 if raw_from_url:
+                    # Shuffle CSV/fallback separately
                     random.shuffle(raw_from_url)
                     fallback_raw = raw_from_url[:remaining]
             else:
                 seed = self.autofill_seed_rows.get(gid) or []
                 if seed:
                     pick = seed[:]
+                    # Shuffle CSV/fallback separately
                     random.shuffle(pick)
                     pick = pick[:remaining]
                     fallback_raw = [
@@ -1234,7 +1606,29 @@ class RadioBot(commands.Cog):
                         for r in pick
                     ]
 
-        combined_raw = liked_raw + fallback_raw
+        # Combine: user songs first, then CSV (preserve order after separate shuffles)
+        # Deduplicate by URL to avoid duplicates between liked_raw and fallback_raw
+        seen_urls = set()
+        combined_raw = []
+        
+        # Add liked_raw items first (preserve order, skip duplicates)
+        for it in liked_raw:
+            url = str(it.get("url") or it.get("suno_url") or "").strip()
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                combined_raw.append(it)
+        
+        # Add fallback_raw items (skip duplicates)
+        for it in fallback_raw:
+            url = str(it.get("url") or it.get("suno_url") or "").strip()
+            if not url:
+                # If no URL, skip it (will be filtered later anyway)
+                continue
+            if url in seen_urls:
+                continue  # Skip duplicates
+            seen_urls.add(url)
+            combined_raw.append(it)
+        
         if not combined_raw:
             return 0
 
@@ -1252,10 +1646,28 @@ class RadioBot(commands.Cog):
             return 0
 
         tracks = await self._resolve_tracks(cleaned_raw, max_workers=6)
-        random.shuffle(tracks)
+        # Don't shuffle here - we've already shuffled separately and want to preserve order (user songs first, then CSV)
+
+        # Filter out tracks with BOTH "Unknown Title" and "Unknown" artist for autofill queue
+        valid_tracks = []
+        for t in tracks:
+            title = (t.get("title") or "").strip().lower()
+            artist = (t.get("artist") or t.get("author") or "").strip().lower()
+            
+            # Check if track has BOTH unknown title and artist
+            is_unknown_title = title in ("unknown title", "untitled", "")
+            is_unknown_artist = artist in ("unknown", "unknown artist", "", "none")
+            
+            if is_unknown_title and is_unknown_artist:
+                continue  # Skip this track for autofill, but keep in DB
+            
+            valid_tracks.append(t)
+
+        # Apply recently played guard - move recently played songs to the end
+        valid_tracks = self._apply_recently_played_guard(gid, valid_tracks)
 
         now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-        for t in tracks:
+        for t in valid_tracks:
             t["_autofill"] = True
             t.setdefault("tags", []).append("filler")
 
@@ -1268,7 +1680,7 @@ class RadioBot(commands.Cog):
             self.queues[gid].append(t)
 
         save_data(gid, self.queues, self.playlists, self.user_mappings)
-        return len(tracks)
+        return len(valid_tracks)
 
     async def _autofill_after_delay(self, ctx, gid: int, delay: int):
         try:
@@ -1276,6 +1688,10 @@ class RadioBot(commands.Cog):
             if self.queues[gid] or self.current_song:
                 return
             if not self._is_autofill_enabled(gid):
+                return
+            
+            # Check if voice_client exists before trying to enqueue
+            if not ctx.voice_client:
                 return
 
             added = await self._enqueue_autofill_batch(ctx, gid)
@@ -1299,6 +1715,185 @@ class RadioBot(commands.Cog):
         self.auto_play_tasks[gid] = self.bot.loop.create_task(
             self._autofill_after_delay(ctx, gid, use_delay)
         )
+
+    async def _recalculate_autofill_queue(self, guild: discord.Guild):
+        """
+        Completely rebuild the autofill queue based on current listeners in VC.
+        
+        When users join or leave while autofill is playing:
+        1. Keep manual songs as-is
+        2. Completely regenerate the autofill portion using the new user list
+        3. Use weighted selection based on combined likes from current VC users
+        4. Shuffle and deduplicate the new autofill list
+        5. Replace the autofill portion of the queue
+        """
+        gid = guild.id
+        
+        # Check if autofill is enabled
+        if not self._is_autofill_enabled(gid):
+            return
+        
+        # Check if there are any autofill songs in queue
+        queue = self.queues.get(gid, deque())
+        has_autofill = any(song.get("_autofill") for song in queue)
+        if not has_autofill:
+            return  # Only manual songs, no need to recalculate
+        
+        # Check if bot is in VC
+        try:
+            vc = guild.voice_client
+            if not vc or not getattr(vc, "channel", None):
+                return
+        except Exception:
+            return
+        
+        # Split queue into manual and autofill songs (keep manual songs unchanged)
+        manual_songs = [s for s in queue if not s.get("_autofill")]
+        
+        # Create a mock context for methods that need it
+        class MockContext:
+            def __init__(self, guild, voice_client):
+                self.guild = guild
+                self.voice_client = voice_client
+        
+        ctx = MockContext(guild, vc)
+        
+        # --- Completely regenerate autofill from scratch ---
+        
+        # Step 1: Get weighted liked songs for current VC users
+        liked_raw = await self._get_autofill_liked_raw(ctx, gid)
+        random.shuffle(liked_raw)
+        liked_raw = liked_raw[:AUTOFILL_MAX_PULL]
+        remaining = max(0, AUTOFILL_MAX_PULL - len(liked_raw))
+        
+        # Step 2: Fill remaining slots with CSV/URL fallback
+        fallback_raw: list[dict] = []
+        if remaining > 0:
+            url = (self.auto_playlist_urls.get(gid) or "").strip()
+            if url:
+                raw_from_url = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _scrape_playlist_to_tracks(url, limit=AUTOFILL_MAX_PULL)
+                )
+                if raw_from_url:
+                    random.shuffle(raw_from_url)
+                    fallback_raw = raw_from_url[:remaining]
+            else:
+                seed = self.autofill_seed_rows.get(gid) or []
+                if seed:
+                    pick = seed[:]
+                    random.shuffle(pick)
+                    pick = pick[:remaining]
+                    fallback_raw = [
+                        {"url": r["url"], "requested_by_note": r.get("requested_by", "")}
+                        for r in pick
+                    ]
+        
+        # Step 3: Combine and deduplicate by URL
+        seen_urls = set()
+        combined_raw = []
+        
+        for it in liked_raw:
+            url = str(it.get("url") or it.get("suno_url") or "").strip()
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                combined_raw.append(it)
+        
+        for it in fallback_raw:
+            url = str(it.get("url") or it.get("suno_url") or "").strip()
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                combined_raw.append(it)
+        
+        if not combined_raw:
+            # No autofill songs available - just keep manual songs
+            queue.clear()
+            queue.extend(manual_songs)
+            save_data(gid, self.queues, self.playlists, self.user_mappings)
+            return
+        
+        # Step 4: Clean URLs
+        cleaned_raw = []
+        for it in combined_raw:
+            u = str(it.get("url") or it.get("suno_url") or "").strip()
+            if not u:
+                continue
+            if not (u.startswith("http://") or u.startswith("https://") or u.startswith("songs/")):
+                continue
+            it["url"] = u
+            cleaned_raw.append(it)
+        
+        if not cleaned_raw:
+            queue.clear()
+            queue.extend(manual_songs)
+            save_data(gid, self.queues, self.playlists, self.user_mappings)
+            return
+        
+        # Step 5: Resolve tracks
+        tracks = await self._resolve_tracks(cleaned_raw, max_workers=6)
+        
+        # Step 6: Filter out tracks with BOTH "Unknown Title" and "Unknown" artist
+        valid_tracks = []
+        for t in tracks:
+            title = (t.get("title") or "").strip().lower()
+            artist = (t.get("artist") or t.get("author") or "").strip().lower()
+            
+            is_unknown_title = title in ("unknown title", "untitled", "")
+            is_unknown_artist = artist in ("unknown", "unknown artist", "", "none")
+            
+            if is_unknown_title and is_unknown_artist:
+                continue
+            
+            valid_tracks.append(t)
+        
+        # Step 7: Mark as autofill and set metadata
+        now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        for t in valid_tracks:
+            t["_autofill"] = True
+            t.setdefault("tags", []).append("filler")
+            t["requester_id"] = self.bot.user.id if self.bot.user else None
+            t["requester_tag"] = "Autofill"
+            t["requester_name"] = "Autofill"
+            t["requester_mention"] = None
+            t["requested_at"] = now_ts
+        
+        # Step 8: Final shuffle
+        random.shuffle(valid_tracks)
+        
+        # Step 9: Final deduplication check by track_id and URL (safety net)
+        final_autofill = []
+        seen_track_ids = set()
+        seen_final_urls = set()
+        
+        for t in valid_tracks:
+            track_id = _canonical_track_id(t)
+            track_url = str(t.get("url") or t.get("suno_url") or "").strip()
+            
+            # Skip if we've seen this track_id before
+            if track_id and track_id in seen_track_ids:
+                continue
+            
+            # Skip if we've seen this URL before
+            if track_url and track_url in seen_final_urls:
+                continue
+            
+            # Add to seen sets
+            if track_id:
+                seen_track_ids.add(track_id)
+            if track_url:
+                seen_final_urls.add(track_url)
+            
+            final_autofill.append(t)
+        
+        # Apply recently played guard - move recently played songs to the end
+        final_autofill = self._apply_recently_played_guard(gid, final_autofill)
+        
+        # Step 10: Reconstruct queue - manual songs first, then new autofill songs
+        queue.clear()
+        queue.extend(manual_songs)
+        queue.extend(final_autofill)
+        
+        # Save queue state
+        save_data(gid, self.queues, self.playlists, self.user_mappings)
 
     # ===== Queue add limit helpers ==========================================
     def _limit_is_on(self, gid: int) -> bool:
@@ -1460,6 +2055,8 @@ class RadioBot(commands.Cog):
             await self.bot.change_presence(activity=None)
         except Exception:
             pass
+        # Clean up all prefetched files on shutdown
+        self._cleanup_all_prefetched_files()
 
     @commands.hybrid_command(name='join', description='Join a voice channel')
     @app_commands.describe(channel='Voice channel to join (optional, defaults to your current)')
@@ -1533,6 +2130,8 @@ class RadioBot(commands.Cog):
         if self.update_song_activity.is_running():
             self.update_song_activity.stop()
         await self.bot.change_presence(activity=None)
+        # Clean up all prefetched files when leaving
+        self._cleanup_all_prefetched_files()
         embed = discord.Embed(title="👋 Left", description=f"Left {channel_name} 🎧", color=0xff0000)
         await ctx.send(embed=embed)
 
@@ -1540,7 +2139,7 @@ class RadioBot(commands.Cog):
     @app_commands.describe(channel='Play a song using !play [url]')
     async def play(self, ctx, url: str = ""):
         """
-        Plays a song by url (Suno url supported only) or scrapes recent if blank.
+        Plays a song by url (Suno song or playlist URL supported).
         """
         if not ctx.voice_client:
             await ctx.invoke(self.join)
@@ -1565,10 +2164,10 @@ class RadioBot(commands.Cog):
             if not url.strip():
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     raw_tracks = await asyncio.get_event_loop().run_in_executor(
-                        executor, scrape_suno_songs, "", 5
+                        executor, _scrape_playlist_to_tracks, "", 5
                     )
                 if not raw_tracks:
-                    embed = discord.Embed(title="❌ Error", description="Failed to scrape Suno songs.", color=0xff0000)
+                    embed = discord.Embed(title="❌ Missing URL", description="Please provide a Suno song or playlist URL.\n\nUsage: `!play <url>`", color=0xff0000)
                     await ctx.send(embed=embed)
                     return
 
@@ -1618,6 +2217,16 @@ class RadioBot(commands.Cog):
                 song = extract_song_info(url)
                 if song is None:
                     raise ValueError("Failed to extract song information: extract_song_info returned None")
+                
+                # Guard against SoundCloud PRO previews (30 seconds or shorter)
+                if "soundcloud.com" in url.lower():
+                    duration = song.get("duration")
+                    if duration is not None and duration <= 30:
+                        raise ValueError(
+                            "This appears to be a SoundCloud PRO preview (30 seconds or shorter). "
+                            "The full track is only available to SoundCloud Go+ subscribers"
+                        )
+                
                 song.setdefault("artist", song.pop("author", None))
 
                 song["requester_id"] = requester_id
@@ -1635,14 +2244,14 @@ class RadioBot(commands.Cog):
                 save_data(guild_id, self.queues, self.playlists, self.user_mappings)
 
                 eta_sec, eta_unknown = self._estimate_eta_seconds(guild_id, position)
-                embed = build_added_embed(
+                embed, thumb_file = build_added_embed(
                     song,
                     requester_mention=requester_mention,
                     position=position,
                     eta_seconds=eta_sec,
                     eta_unknown=eta_unknown
                 )
-                await ctx.send(embed=embed)
+                await ctx.send(embed=embed, file=thumb_file) if thumb_file else await ctx.send(embed=embed)
 
             if not ctx.voice_client.is_playing():
                 await self.play_next(ctx)
@@ -1655,10 +2264,24 @@ class RadioBot(commands.Cog):
             )
             await ctx.send(embed=embed)
 
-    async def _cleanup_np_autofill(self, gid: int):
+    def _prune_non_autofill(self, gid: int) -> bool:
+        """Check if non-autofill NP cards should be pruned for this guild."""
+        if gid in self.np_clean_non_autofill:
+            return self.np_clean_non_autofill[gid]
+        
+        # Fallback to user_mappings if loaded
+        amap = self.user_mappings.get(gid) or {}
+        if isinstance(amap, dict) and "np_clean_non_autofill" in amap:
+            self.np_clean_non_autofill[gid] = bool(amap["np_clean_non_autofill"])
+            return self.np_clean_non_autofill[gid]
+        
+        return REMOVE_NON_AUTOFILL_NP
+
+    async def _cleanup_now_playing_messages(self, gid: int):
         """
-        Delete autofill Now Playing messages that are older than the last N songs.
-        Only touches messages that correspond to autofill tracks.
+        Delete Now Playing messages that are older than the last N songs.
+        Autofill messages are always cleaned up; non-autofill messages
+        are only cleaned up if REMOVE_NON_AUTOFILL_NP is True or toggled ON.
         """
         if self._np_retention_n <= 0:
             return
@@ -1668,18 +2291,64 @@ class RadioBot(commands.Cog):
 
         current_idx = self._song_index.get(gid, 0)
         keep = []
+        
+        prune_non_autofill = self._prune_non_autofill(gid)
+
         for e in entries:
-            if e.get("is_autofill") and (current_idx - e.get("song_index", current_idx)) >= self._np_retention_n:
-                try:
-                    ch = self.bot.get_channel(e["channel_id"])
-                    if ch:
-                        msg = await ch.fetch_message(e["message_id"])
-                        await msg.delete()
-                except Exception:
-                    pass
-            else:
-                keep.append(e)
+            is_autofill = e.get("is_autofill", False)
+            # Delete if the gap is >= retention_n AND (it's autofill OR toggle is ON)
+            if (current_idx - e.get("song_index", current_idx)) >= self._np_retention_n:
+                if is_autofill or prune_non_autofill:
+                    try:
+                        ch = self.bot.get_channel(e["channel_id"])
+                        if ch:
+                            # Fetch the message to check reactions
+                            msg = await ch.fetch_message(e["message_id"])
+                            # Count total reactions (sum of all reaction counts)
+                            reaction_count = sum(reaction.count for reaction in msg.reactions)
+                            # Skip deletion if message has more than 2 reactions
+                            if reaction_count > 2:
+                                keep.append(e)
+                                continue
+                            await msg.delete()
+                    except Exception:
+                        pass
+                # Once it's outside the retention window, we stop tracking it regardless
+                continue
+            
+            keep.append(e)
         self._np_track[gid] = keep
+
+    def _cleanup_prefetched_file(self, local_path: str | None) -> None:
+        """
+        Safely remove a prefetched file if it exists.
+        Used when playback fails or is skipped before starting.
+        """
+        if not local_path:
+            return
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception as e:
+            print(f"Prefetch cleanup failed: {local_path}: {e}")
+
+    def _cleanup_all_prefetched_files(self) -> None:
+        """
+        Clean up all files in the prefetch directory.
+        Used when the bot stops/resets/leaves to prevent accumulation.
+        """
+        if not PREFETCH_DIR or not os.path.exists(PREFETCH_DIR):
+            return
+        try:
+            for filename in os.listdir(PREFETCH_DIR):
+                file_path = os.path.join(PREFETCH_DIR, filename)
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                except Exception as e:
+                    print(f"Failed to remove prefetched file {file_path}: {e}")
+        except Exception as e:
+            print(f"Failed to clean prefetch directory {PREFETCH_DIR}: {e}")
 
     async def play_next(self, ctx):
         gid = ctx.guild.id
@@ -1727,31 +2396,63 @@ class RadioBot(commands.Cog):
                     except Exception:
                         pass
                 
-                # Continue to next song in queue
+                # If there are other songs in queue, continue to next song
                 if queue and ctx.voice_client:
                     self.bot.loop.create_task(self.play_next(ctx))
+                else:
+                    # No other songs follow - trigger queue empty behavior to resume autofill
+                    self.current_song = None
+                    self.song_start_time = None
+                    if self.update_song_activity.is_running():
+                        self.update_song_activity.stop()
+                    await self.bot.change_presence(activity=None)
+                    
+                    embed2 = discord.Embed(title="⏹️ Queue Empty", description="Finished playing! 🎉", color=0x00ff00)
+                    try:
+                        await channel.send(embed=embed2)
+                    except Exception:
+                        pass
+                    try:
+                        self._schedule_autofill_if_idle(ctx)
+                    except Exception:
+                        pass
                 return
 
             track_id = _canonical_track_id(song)
             if track_id:
                 try:
-                    upsert_track_basic(
-                        track_id=track_id,
-                        title=song.get("title"),
-                        artist=song.get("artist") or song.get("author"),
-                        cover_url=song.get("thumbnail") or song.get("thumb") or song.get("image"),
-                        source_url=_derive_suno_url(song),
-                        duration_sec=_duration_to_seconds(song.get("duration")),
-                    )
-                    play_id = log_play_start(
-                        track_id=track_id,
-                        guild_id=ctx.guild.id,
-                        channel_id=ctx.channel.id,
-                        requested_by=str(song.get("requester_id") or getattr(ctx.author, "id", "")),
-                        context="autofill" if song.get("_autofill") else "queue",
-                    )
-                    song["_track_id"] = track_id
-                    song["_play_id"] = play_id
+                    title = song.get("title")
+                    artist = song.get("artist") or song.get("author")
+                    
+                    # Check if track has BOTH unknown title and artist - skip adding to DB
+                    title_lower = (title or "").strip().lower()
+                    artist_lower = (artist or "").strip().lower()
+                    
+                    is_unknown_title = title_lower in ("unknown title", "untitled", "")
+                    is_unknown_artist = artist_lower in ("unknown", "unknown artist", "", "none")
+                    
+                    if is_unknown_title and is_unknown_artist:
+                        # Don't add to database/log if both are unknown, but don't delete existing
+                        song["_track_id"] = None
+                        song["_play_id"] = None
+                    else:
+                        upsert_track_basic(
+                            track_id=track_id,
+                            title=title,
+                            artist=artist,
+                            cover_url=song.get("thumbnail") or song.get("thumb") or song.get("image"),
+                            source_url=_derive_suno_url(song),
+                            duration_sec=_duration_to_seconds(song.get("duration")),
+                        )
+                        play_id = log_play_start(
+                            track_id=track_id,
+                            guild_id=ctx.guild.id,
+                            channel_id=ctx.channel.id,
+                            requested_by=str(song.get("requester_id") or getattr(ctx.author, "id", "")),
+                            context="autofill" if song.get("_autofill") else "queue",
+                        )
+                        song["_track_id"] = track_id
+                        song["_play_id"] = play_id
                 except Exception as e:
                     print(f"[history] start log failed: {e}")
             else:
@@ -1759,34 +2460,125 @@ class RadioBot(commands.Cog):
                 song["_play_id"] = None
 
             local_to_delete = None
+            url_val = str(song.get("url", "")).strip()
+            original_url = url_val  # Save original URL in case prefetch file is corrupted
+            
+            # For yt-dlp sources (SoundCloud, Bandcamp, etc.), re-extract fresh URL at playback time
+            # because these platforms use signed URLs that expire after ~15-30 minutes
+            if song.get("_source") and song.get("_original_url"):
+                try:
+                    from src.utils.ytdlp_extractor import extract_with_ytdlp
+                    fresh_info = extract_with_ytdlp(song["_original_url"], download_thumbnail=False)
+                    if fresh_info and fresh_info.get("url"):
+                        url_val = fresh_info["url"]
+                        song["url"] = url_val  # Update song dict with fresh URL
+                        # Also update _downloaded_file if a new one was created
+                        if fresh_info.get("_downloaded_file"):
+                            local_to_delete = fresh_info["_downloaded_file"]
+                        print(f"[play_next] Refreshed URL for {song.get('title', 'Unknown')[:50]}")
+                    else:
+                        print(f"[play_next] Failed to refresh URL for {song.get('_original_url')}, using cached URL")
+                except Exception as e:
+                    print(f"[play_next] URL refresh failed for {song.get('_original_url')}: {e}")
+                    # Continue with the cached URL - it may still work if not expired
+            
             try:
                 lp = await maybe_prefetch(song)
                 if lp and PREFETCH_MODE == "full":
-                    local_to_delete = lp
+                    # Validate prefetched file before using it
+                    if os.path.exists(lp) and os.path.getsize(lp) > 0:
+                        local_to_delete = lp
+                        url_val = str(lp)  # Use prefetched file
+                    else:
+                        print(f"Prefetched file is corrupted or empty: {lp}, falling back to original URL")
+                        self._cleanup_prefetched_file(lp)
+                        url_val = original_url  # Fall back to original URL
             except Exception as e:
                 print(f"Prefetch failed for {song.get('url')}: {e}")
+                url_val = original_url  # Fall back to original URL on any error
 
             # ---- FFmpeg options (latency + stability tuned) ------------------
-            af_filter = (
-                "aresample=async=1:min_hard_comp=0.10:first_pts=0,"
-                f"adelay={STARTUP_ADELAY_MS}|{STARTUP_ADELAY_MS}"
-            )
-            base_opts = (
-                f"-vn "
-                f"-probesize {FFMPEG_PROBESIZE} "
-                f"-analyzeduration {FFMPEG_ANALYZEDURATION} "
-                f"-thread_queue_size {FFMPEG_THREAD_QUEUE_SIZE} "
-                f"-buffer_size {FFMPEG_BUFFER_SIZE} "
-                f"-max_delay {FFMPEG_MAX_DELAY_US} "
-                f"-af {af_filter}"
-            )
-            if FFMPEG_NOBUFFER:
-                base_opts += " -fflags +nobuffer"
-
-            url_val = str(song.get("url", "")).strip()
             is_http = url_val.startswith(("http://", "https://"))
+            is_hls = ".m3u8" in url_val or "/hls" in url_val.lower()
+            is_ytdlp_source = bool(song.get("_source"))  # SoundCloud, Bandcamp, etc.
 
-            if is_http:
+            # For local prefetched files - simpler, more reliable options
+            # No async resampling needed since the file is complete and consistent
+            if not is_http:
+                local_af = f"adelay={STARTUP_ADELAY_MS}|{STARTUP_ADELAY_MS}"
+                base_opts = (
+                    f"-vn "
+                    f"-probesize {FFMPEG_PROBESIZE} "
+                    f"-analyzeduration {FFMPEG_ANALYZEDURATION} "
+                    f"-af {local_af}"
+                )
+                ffmpeg_options = {
+                    "before_options": "-nostdin",
+                    "options": base_opts,
+                }
+            elif is_ytdlp_source and not is_hls:
+                # For yt-dlp HTTP streams (SoundCloud direct, Bandcamp, etc.)
+                # These are generally stable - no async resampling needed
+                local_af = f"adelay={STARTUP_ADELAY_MS}|{STARTUP_ADELAY_MS}"
+                base_opts = (
+                    f"-vn "
+                    f"-probesize {FFMPEG_PROBESIZE} "
+                    f"-analyzeduration {FFMPEG_ANALYZEDURATION} "
+                    f"-af {local_af}"
+                )
+                before_opts = (
+                    "-reconnect 1 "
+                    "-reconnect_streamed 1 "
+                    "-reconnect_delay_max 5 "
+                    f"-rw_timeout {FFMPEG_RW_TIMEOUT_US} "
+                    "-nostdin"
+                )
+                ffmpeg_options = {
+                    "before_options": before_opts,
+                    "options": base_opts,
+                }
+            elif is_hls:
+                # For HLS streams (SoundCloud, etc.) - special handling
+                # HLS manages its own segments, so we use different options
+                af_filter = (
+                    "aresample=async=1000:min_hard_comp=0.01:first_pts=0,"
+                    f"adelay={STARTUP_ADELAY_MS}|{STARTUP_ADELAY_MS}"
+                )
+                base_opts = (
+                    f"-vn "
+                    f"-probesize {FFMPEG_PROBESIZE} "
+                    f"-analyzeduration {FFMPEG_ANALYZEDURATION} "
+                    f"-af {af_filter}"
+                )
+                # HLS needs protocol whitelist and different reconnect handling
+                before_opts = (
+                    "-protocol_whitelist file,http,https,tcp,tls,crypto "
+                    f"-rw_timeout {FFMPEG_RW_TIMEOUT_US} "
+                    "-nostdin"
+                )
+                ffmpeg_options = {
+                    "before_options": before_opts,
+                    "options": base_opts,
+                }
+            else:
+                # For regular HTTP streams (Suno CDN, direct files)
+                # async=1000 gives more tolerance, min_hard_comp=0.01 reduces artifacts
+                af_filter = (
+                    "aresample=async=1000:min_hard_comp=0.01:first_pts=0,"
+                    f"adelay={STARTUP_ADELAY_MS}|{STARTUP_ADELAY_MS}"
+                )
+                base_opts = (
+                    f"-vn "
+                    f"-probesize {FFMPEG_PROBESIZE} "
+                    f"-analyzeduration {FFMPEG_ANALYZEDURATION} "
+                    f"-thread_queue_size {FFMPEG_THREAD_QUEUE_SIZE} "
+                    f"-buffer_size {FFMPEG_BUFFER_SIZE} "
+                    f"-max_delay {FFMPEG_MAX_DELAY_US} "
+                    f"-af {af_filter}"
+                )
+                if FFMPEG_NOBUFFER:
+                    base_opts += " -fflags +nobuffer"
+
                 before_opts = (
                     "-reconnect 1 "
                     "-reconnect_streamed 1 "
@@ -1799,16 +2591,14 @@ class RadioBot(commands.Cog):
                     "before_options": before_opts,
                     "options": base_opts,
                 }
-            else:
-                ffmpeg_options = {
-                    "options": base_opts,
-                }
 
             try:
                 source = discord.FFmpegPCMAudio(url_val, **ffmpeg_options)
                 volume_transformer = discord.PCMVolumeTransformer(source, volume=self.volumes[gid])
             except Exception as e:
                 print(f"Audio source error: {e} for {song.get('url')}")
+                # Clean up prefetched file before returning
+                self._cleanup_prefetched_file(local_to_delete)
                 embed = discord.Embed(
                     title="❌ Playback Error",
                     description=f"Failed to play {song.get('title','Unknown')}: {str(e)}",
@@ -1833,12 +2623,8 @@ class RadioBot(commands.Cog):
                     except Exception as e_end:
                         print(f"[history] end log failed: {e_end}")
 
-                    if local_to_delete:
-                        try:
-                            if os.path.exists(local_to_delete):
-                                os.remove(local_to_delete)
-                        except Exception as _e:
-                            print(f"Prefetch cleanup failed: {local_to_delete}: {_e}")
+                    # Use the helper method for cleanup
+                    self._cleanup_prefetched_file(local_to_delete)
 
                     self.current_song = None
                     self.song_start_time = None
@@ -1846,17 +2632,46 @@ class RadioBot(commands.Cog):
                         self.update_song_activity.stop()
                     asyncio.run_coroutine_threadsafe(self.bot.change_presence(activity=None), self.bot.loop)
 
-                    if queue and ctx.voice_client:
-                        self.bot.loop.call_soon_threadsafe(lambda: self.bot.loop.create_task(self.play_next(ctx)))
-                    elif not queue:
-                        embed2 = discord.Embed(title="⏹️ Queue Empty", description="Finished playing! 🎉", color=0x00ff00)
-                        asyncio.run_coroutine_threadsafe(self.get_radio_channel(ctx).send(embed=embed2), self.bot.loop)
+                    # Check voice client state more carefully before continuing
+                    vc = ctx.voice_client
+                    vc_valid = vc is not None and getattr(vc, "channel", None) is not None
+                    
+                    if queue and vc_valid:
+                        # Double-check we're still connected before playing next
+                        try:
+                            # Only continue if voice client is actually connected
+                            if hasattr(vc, 'ws') and vc.ws and not vc.ws.closed:
+                                self.bot.loop.call_soon_threadsafe(lambda: self.bot.loop.create_task(self.play_next(ctx)))
+                            else:
+                                print(f"[after_playing] Voice client not connected, skipping next song")
+                        except Exception:
+                            # If we can't check connection state, try anyway (better than stopping)
+                            try:
+                                self.bot.loop.call_soon_threadsafe(lambda: self.bot.loop.create_task(self.play_next(ctx)))
+                            except Exception as e_vc:
+                                print(f"[after_playing] Failed to schedule next song: {e_vc}")
+                    
+                    # Always try to schedule autofill when queue is empty (it will check voice client internally)
+                    if not queue:
+                        if vc_valid:
+                            embed2 = discord.Embed(title="⏹️ Queue Empty", description="Finished playing! 🎉", color=0x00ff00)
+                            try:
+                                asyncio.run_coroutine_threadsafe(self.get_radio_channel(ctx).send(embed=embed2), self.bot.loop)
+                            except Exception:
+                                pass
+                        
+                        # Schedule autofill (it will check voice client and enabled state internally)
                         try:
                             self.bot.loop.call_soon_threadsafe(lambda: self._schedule_autofill_if_idle(ctx))
                         except Exception as _e:
                             print(f"[autofill schedule] {_e}")
+                    elif not vc_valid:
+                        # Voice client disconnected, don't try to continue
+                        print(f"[after_playing] Voice client disconnected, not continuing playback")
                 except Exception as e2:
                     print(f"after_playing crashed: {e2}")
+                    import traceback
+                    traceback.print_exc()
 
             target_vol = self.volumes[gid]
             start_muted = (PREBUFFER_SECONDS > 0) or (FADE_IN_SECONDS > 0)
@@ -1904,9 +2719,15 @@ class RadioBot(commands.Cog):
                          or song.get("requester_name")
                          or song.get("requester_tag"))
             upcoming_two = list(self.queues[gid])[:2]
-            np_embed = build_now_playing_embed(song, requester_mention=requester, upcoming_tracks=upcoming_two)
+            np_embed, thumb_file = build_now_playing_embed(song, requester_mention=requester, upcoming_tracks=upcoming_two)
 
-            song_url = _derive_suno_url(song) or (song.get("url") or "")
+            # Get the best page URL for the song (supports Suno, SoundCloud, Bandcamp, etc.)
+            song_url = (
+                song.get("_original_url") or  # yt-dlp sources (SoundCloud, Bandcamp, etc.)
+                song.get("video_url") or      # yt-dlp alternative
+                _derive_suno_url(song) or     # Suno tracks
+                (song.get("url") or "")
+            )
             song_title = song.get("title") or song.get("track_id") or "Untitled"
 
             view = NowPlayingView(
@@ -1919,7 +2740,7 @@ class RadioBot(commands.Cog):
             )
 
             ch = self.get_radio_channel(ctx)
-            sent_message = await ch.send(embed=np_embed, view=view)
+            sent_message = await ch.send(embed=np_embed, view=view, file=thumb_file) if thumb_file else await ch.send(embed=np_embed, view=view)
 
             try:
                 if sent_message:
@@ -1933,15 +2754,17 @@ class RadioBot(commands.Cog):
             except Exception:
                 pass
 
-            await self._cleanup_np_autofill(gid)
+            await self._cleanup_now_playing_messages(gid)
 
     @commands.command(name='queue')
     async def show_queue(self, ctx):
         """
             Shows the current queue with estimated time to start for each item.
+            Supports pagination for large queues.
         """
         guild_id = ctx.guild.id
         queue = self.queues[guild_id]
+        
         if not queue:
             embed = discord.Embed(
                 title="📋 Queue",
@@ -1950,39 +2773,22 @@ class RadioBot(commands.Cog):
             )
             await ctx.send(embed=embed)
             return
-
+        
         eta_list = self._queue_eta_list(guild_id)
-
-        max_lines = 15
-        lines = []
-        for i, (song, eta_sec) in enumerate(zip(queue, eta_list), start=1):
-            title_link = _track_title_link(song) + _filler_badge(song)
-            artist_raw = (song.get("artist") or song.get("author") or "Unknown Artist").strip()
-            artist = escape_markdown(artist_raw)
-            requester = (song.get("requester_mention")
-                         or (f"<@{song['requester_id']}>" if song.get("requester_id") else None)
-                         or song.get("requester_tag")
-                         or song.get("requester_name")
-                         or "someone")
-            if eta_sec is None:
-                eta_str = "≈unknown"
-            else:
-                eta_str = _fmt_duration(max(0, int(eta_sec)))
-
-            lines.append(f"{i}. {title_link} by {artist}\n Up in ~{eta_str} / Requested by {requester}")
-            if i >= max_lines:
-                break
-
-        remaining = len(queue) - max_lines
-        if remaining > 0:
-            lines.append(f"… and **{remaining}** more in queue")
-
-        embed = discord.Embed(
-            title="📋 Current Queue",
-            description="\n".join(lines),
-            color=0x0099ff
+        
+        view = PaginatedQueueView(
+            queue=queue,
+            eta_list=eta_list,
         )
-        await ctx.send(embed=embed)
+        
+        # Delete the command message if it should be auto-deleted
+        try:
+            if ctx.message and ctx.command and ctx.command.name in AUTO_DELETE_COMMANDS:
+                await ctx.message.delete()
+        except Exception:
+            pass
+        
+        await view.send(ctx.channel)
 
     @commands.command(name='skip')
     async def skip(self, ctx, target: str = ""):
@@ -2143,11 +2949,11 @@ class RadioBot(commands.Cog):
             await ctx.send(embed=embed)
             return
 
-        embed = build_song_info_embed(self.current_song)
-        await ctx.send(embed=embed)
+        embed, thumb_file = build_song_info_embed(self.current_song)
+        await ctx.send(embed=embed, file=thumb_file) if thumb_file else await ctx.send(embed=embed)
 
     @commands.command(name='playlist')
-    async def playlist(self, ctx, url: str, max_items: int = 100):
+    async def playlist(self, ctx, url: str, max_items: int = 200):
         """
         Enqueue tracks from a Suno playlist/profile/handle in bulk
         Usage: !playlist https://suno.com/playlist/##"
@@ -2163,66 +2969,105 @@ class RadioBot(commands.Cog):
         self._cancel_autofill_task(guild_id)
         self._clear_autofill_from_queue(guild_id)
 
+        status_msg = await ctx.send(embed=discord.Embed(
+            title="⏳ Processing Playlist",
+            description="Fetching tracks from Suno, please wait...",
+            color=0xf1c40f
+        ))
+
         try:
-            loop = asyncio.get_event_loop()
-            raw_tracks = await loop.run_in_executor(
-                None, lambda: scrape_suno_songs(url, limit=max_items)
-            )
-            if not raw_tracks:
-                embed = discord.Embed(
-                    title="❌ No Tracks Found",
-                    description="Couldn't find songs on that page.",
-                    color=0xff0000
+            async with ctx.typing():
+                loop = asyncio.get_event_loop()
+                raw_tracks = await loop.run_in_executor(
+                    None, lambda: _scrape_playlist_to_tracks(url, limit=max_items)
                 )
+                if not raw_tracks:
+                    await status_msg.delete()
+                    embed = discord.Embed(
+                        title="❌ No Tracks Found",
+                        description="Couldn't find songs on that page.",
+                        color=0xff0000
+                    )
+                    await ctx.send(embed=embed)
+                    return
+
+                intended = len(raw_tracks)
+                allowed, notice = self._enforce_queue_add_limit(
+                    guild_id, intended, bypass=is_admin
+                )
+
+                if allowed <= 0:
+                    await status_msg.delete()
+                    await ctx.send(embed=discord.Embed(
+                        title="🚫 Queue Limit",
+                        description=notice or "Queue limit reached for bulk adds.",
+                        color=0xe74c3c
+                    ))
+                    return
+                if allowed < intended:
+                    raw_tracks = raw_tracks[:allowed]
+
+                tracks = await self._resolve_tracks(raw_tracks, max_workers=6)
+
+                # ✅ define timestamp once
+                now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+                # Build set of existing track IDs in queue to check for duplicates
+                existing_track_ids = set()
+                for existing_track in queue:
+                    track_id = _canonical_track_id(existing_track)
+                    if track_id:
+                        existing_track_ids.add(track_id)
+
+                start_pos = len(queue) + 1
+                added_count = 0
+                duplicate_count = 0
+                
+                for t in tracks:
+                    # Check for duplicates
+                    track_id = _canonical_track_id(t)
+                    if track_id and track_id in existing_track_ids:
+                        duplicate_count += 1
+                        continue
+                    
+                    # Add track to queue
+                    t["requester_id"] = ctx.author.id
+                    t["requester_tag"] = str(ctx.author)
+                    t["requester_name"] = ctx.author.display_name
+                    t["requester_mention"] = ctx.author.mention
+                    t["requested_at"] = now_ts
+                    t["_from_playlist"] = True  # optional but nice if you want later filtering
+                    queue.append(t)
+                    added_count += 1
+                    
+                    # Add to existing set to prevent duplicates within the same batch
+                    if track_id:
+                        existing_track_ids.add(track_id)
+
+                end_pos = len(queue)
+                save_data(guild_id, self.queues, self.playlists, self.user_mappings)
+
+                await status_msg.delete()
+
+                desc = f"Added {added_count} tracks!"
+                if duplicate_count > 0:
+                    desc += f" ({duplicate_count} duplicate{'s' if duplicate_count != 1 else ''} skipped)"
+                if end_pos >= start_pos:
+                    desc += f" (positions #{start_pos}–#{end_pos})"
+                if notice:
+                    desc += f"\n\n{notice}"
+
+                embed = discord.Embed(title="➕ Added Playlist", description=desc, color=0x0099ff)
                 await ctx.send(embed=embed)
-                return
 
-            intended = len(raw_tracks)
-            allowed, notice = self._enforce_queue_add_limit(
-                guild_id, intended, bypass=is_admin
-            )
-
-            if allowed <= 0:
-                await ctx.send(embed=discord.Embed(
-                    title="🚫 Queue Limit",
-                    description=notice or "Queue limit reached for bulk adds.",
-                    color=0xe74c3c
-                ))
-                return
-            if allowed < intended:
-                raw_tracks = raw_tracks[:allowed]
-
-            tracks = await self._resolve_tracks(raw_tracks, max_workers=6)
-
-            # ✅ define timestamp once
-            now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-
-            start_pos = len(queue) + 1
-            for t in tracks:
-                t["requester_id"] = ctx.author.id
-                t["requester_tag"] = str(ctx.author)
-                t["requester_name"] = ctx.author.display_name
-                t["requester_mention"] = ctx.author.mention
-                t["requested_at"] = now_ts
-                t["_from_playlist"] = True  # optional but nice if you want later filtering
-                queue.append(t)
-
-            end_pos = len(queue)
-            save_data(guild_id, self.queues, self.playlists, self.user_mappings)
-
-            desc = f"Added {len(tracks)} tracks!"
-            if end_pos >= start_pos:
-                desc += f" (positions #{start_pos}–#{end_pos})"
-            if notice:
-                desc += f"\n\n{notice}"
-
-            embed = discord.Embed(title="➕ Added Playlist", description=desc, color=0x0099ff)
-            await ctx.send(embed=embed)
-
-            if not ctx.voice_client.is_playing():
-                await self.play_next(ctx)
+                if not ctx.voice_client.is_playing():
+                    await self.play_next(ctx)
 
         except Exception as e:
+            try:
+                await status_msg.delete()
+            except:
+                pass
             embed = discord.Embed(
                 title="❌ Error",
                 description=f"Failed to add playlist: {e}",
@@ -2788,6 +3633,52 @@ class RadioBot(commands.Cog):
         ))
 
     @commands.has_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    @commands.command(name="np_clean_on")
+    async def np_clean_on(self, ctx):
+        """
+        Turn on cleanup for ALL Now Playing cards (Admin only).
+        """
+        gid = ctx.guild.id
+        self.np_clean_non_autofill[gid] = True
+        
+        amap = self.user_mappings[gid]
+        if not isinstance(amap, dict):
+            amap = {}
+            self.user_mappings[gid] = amap
+        amap["np_clean_non_autofill"] = True
+        
+        save_data(gid, self.queues, self.playlists, self.user_mappings)
+        
+        await ctx.send(embed=discord.Embed(
+            title="🧹 Now Playing Cleanup",
+            description="Cleanup is now **ON** for all tracks (manual and autofill).",
+            color=0x2ecc71
+        ))
+
+    @commands.has_permissions(administrator=True)
+    @commands.command(name="np_clean_off")
+    async def np_clean_off(self, ctx):
+        """
+        Turn off cleanup for manual tracks; only autofill will be cleaned (Admin only).
+        """
+        gid = ctx.guild.id
+        self.np_clean_non_autofill[gid] = False
+        
+        amap = self.user_mappings[gid]
+        if not isinstance(amap, dict):
+            amap = {}
+            self.user_mappings[gid] = amap
+        amap["np_clean_non_autofill"] = False
+        
+        save_data(gid, self.queues, self.playlists, self.user_mappings)
+        
+        await ctx.send(embed=discord.Embed(
+            title="🧹 Now Playing Cleanup",
+            description="Cleanup is now **OFF** for manual tracks. Autofill tracks will still be cleaned up.",
+            color=0xe67e22
+        ))
+
     @commands.command(name="ping")
     async def ping(self, ctx):
         """
@@ -2895,6 +3786,112 @@ class RadioBot(commands.Cog):
         # Track the new qpanel message
         self._qpanel_messages[guild_id] = msg
 
+    def _create_autofill_saves_view(self, user: discord.User, is_dm: bool = False) -> LikedSongsManagerView:
+        """Helper method to create the autofill saves view."""
+        user_id = user.id
+        
+        # Get all liked tracks for this user
+        tracks = get_user_liked_tracks_all_guilds(user_id)
+        
+        # Filter out deleted tracks (those with Unknown Title/Unknown) but keep them in DB
+        def is_deleted_track(track: dict) -> bool:
+            """Check if a track appears to be deleted (has Unknown Title/Unknown).
+            
+            Tracks are considered deleted if both title and artist are missing/unknown.
+            This filters them from display while keeping them in the database.
+            """
+            title_raw = track.get("title") or ""
+            artist_raw = track.get("artist") or ""
+            
+            title = str(title_raw).strip().lower() if title_raw else ""
+            artist = str(artist_raw).strip().lower() if artist_raw else ""
+            
+            # Check for common "deleted" indicators
+            deleted_titles = {"unknown title", "untitled", ""}
+            deleted_artists = {"unknown", "unknown artist", "", "none"}
+            
+            # Track is deleted if both title and artist are unknown/missing
+            return title in deleted_titles and artist in deleted_artists
+        
+        # Filter out deleted tracks from display (but they remain in the database)
+        visible_tracks = [t for t in tracks if not is_deleted_track(t)]
+        
+        # Delete callback for removing likes
+        async def delete_likes_callback(user_id_str: str, track_id: str) -> None:
+            """Remove all likes from user for a specific track across all guilds."""
+            conn = get_conn()
+            conn.execute(
+                "DELETE FROM likes WHERE user_id = ? AND track_id = ?",
+                (user_id_str, track_id)
+            )
+        
+        # Timeout callback for cleaning up DM message tracking (only for DMs)
+        on_timeout_callback = None
+        if is_dm:
+            async def timeout_cleanup_callback(uid: int) -> None:
+                """Clean up DM message tracking when view times out."""
+                if uid in self._autofill_dm_messages:
+                    del self._autofill_dm_messages[uid]
+            on_timeout_callback = timeout_cleanup_callback
+        
+        # Create and return the view with filtered tracks
+        return LikedSongsManagerView(
+            user=user,
+            tracks=visible_tracks,
+            delete_callback=delete_likes_callback,
+            on_timeout_callback=on_timeout_callback,
+        )
+
+    @commands.hybrid_command(
+        name="autofill_saves",
+        description="Manage your autofill liked songs (private message in channel)",
+        aliases=["mylikes", "autofill"]
+    )
+    async def autofill_saves(self, ctx: commands.Context) -> None:
+        """Show and manage user's autofill liked songs as an ephemeral message."""
+        user = ctx.author
+        
+        # Check if we have an interaction (available for slash command invocations)
+        # Hybrid commands provide ctx.interaction when invoked as slash commands
+        interaction = getattr(ctx, 'interaction', None)
+        
+        if interaction is not None:
+            # Slash command invocation - send ephemeral response
+            view = self._create_autofill_saves_view(user, is_dm=False)
+            await interaction.response.send_message(
+                embed=view._build_embed(), 
+                view=view, 
+                ephemeral=True
+            )
+            view.message = await interaction.original_response()
+        else:
+            # Prefix command invocation - send DM to user (no public response)
+            try:
+                # Delete previous DM message if it exists
+                user_id = user.id
+                if user_id in self._autofill_dm_messages:
+                    old_msg = self._autofill_dm_messages[user_id]
+                    try:
+                        await old_msg.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        # Message already deleted or we don't have permission - ignore
+                        pass
+                    finally:
+                        # Remove from tracking even if deletion failed
+                        del self._autofill_dm_messages[user_id]
+                
+                # Create view with timeout callback for DM cleanup
+                view = self._create_autofill_saves_view(user, is_dm=True)
+                
+                # Send new DM message
+                msg = await user.send(embed=view._build_embed(), view=view)
+                view.message = msg
+                # Track the new message
+                self._autofill_dm_messages[user_id] = msg
+            except (discord.Forbidden, Exception):
+                # User has DMs disabled or other error - silently fail (no public messages)
+                pass
+
     @commands.Cog.listener()
     async def on_command_completion(self, ctx: commands.Context) -> None:
         """
@@ -2939,6 +3936,66 @@ class RadioBot(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             # Silently ignore if we can't delete for some reason
             return
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        """
+        Listen for voice state updates (users joining/leaving VC) and recalculate
+        autofill queue if autofill is active. Includes debouncing to prevent rapid recalculations.
+        """
+        # Ignore bot's own voice state changes
+        if member.bot:
+            return
+        
+        # Check if the change affects a VC where the bot is connected
+        guild = member.guild
+        gid = guild.id
+        
+        # Get the voice channel from before or after
+        vc_channel = None
+        if before.channel:
+            vc_channel = before.channel
+        elif after.channel:
+            vc_channel = after.channel
+        
+        if not vc_channel:
+            return
+        
+        # Check if bot is in this voice channel
+        try:
+            bot_vc = guild.voice_client
+            if not bot_vc or bot_vc.channel != vc_channel:
+                return
+        except Exception:
+            return
+        
+        # Check if autofill is active (enabled AND has autofill songs)
+        if not self._is_autofill_enabled(gid):
+            return
+        
+        queue = self.queues.get(gid, deque())
+        has_autofill = any(song.get("_autofill") for song in queue)
+        if not has_autofill:
+            return  # Only manual songs, no need to recalculate
+        
+        # Debounce: cancel existing timer if any
+        existing_timer = self._autofill_recalc_timers.get(gid)
+        if existing_timer and not existing_timer.done():
+            existing_timer.cancel()
+        
+        # Create new debounced task (2 second delay)
+        async def debounced_recalc():
+            try:
+                await asyncio.sleep(2.0)  # 2 second debounce
+                await self._recalculate_autofill_queue(guild)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"[autofill recalc] failed: {e}")
+            finally:
+                self._autofill_recalc_timers[gid] = None
+        
+        self._autofill_recalc_timers[gid] = self.bot.loop.create_task(debounced_recalc())
 
 async def setup(bot):
     await bot.add_cog(RadioBot(bot))

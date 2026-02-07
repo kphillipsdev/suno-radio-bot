@@ -130,3 +130,5 @@ Thumbs.db
 .idea/
 repomix-output.xml
 src/autofill.csv
+
+sync_config.jsonc

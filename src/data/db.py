@@ -4,11 +4,13 @@
 from __future__ import annotations
 import os
 import sqlite3
+import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _CONN: Optional[sqlite3.Connection] = None
 _DB_PATH: Optional[str] = None
+_DB_LOCK = threading.Lock()
 
 
 def _dict_factory(cursor, row):
@@ -36,7 +38,7 @@ def init_db(db_path: Optional[str] = None) -> None:
     _DB_PATH = db_path or os.getenv("SUNO_RADIO_DB", "./suno_radio.db")
     os.makedirs(os.path.dirname(_DB_PATH) or ".", exist_ok=True)
 
-    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=True)
+    conn = sqlite3.connect(_DB_PATH, isolation_level=None, check_same_thread=False)
     conn.row_factory = _dict_factory
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
@@ -186,23 +188,24 @@ def log_play_start(*,
 def log_play_end(*, track_id: str, play_id: Optional[int] = None) -> None:
     conn = get_conn()
     now = int(time.time())
-    if play_id is not None:
-        conn.execute(
-            "UPDATE plays SET ended_at=? WHERE play_id=? AND ended_at IS NULL",
-            (now, play_id),
-        )
-    else:
-        conn.execute(
-            "UPDATE plays SET ended_at=? WHERE track_id=? AND ended_at IS NULL ORDER BY play_id DESC LIMIT 1",
-            (now, track_id),
-        )
+    with _DB_LOCK:
+        if play_id is not None:
+            conn.execute(
+                "UPDATE plays SET ended_at=? WHERE play_id=? AND ended_at IS NULL",
+                (now, play_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE plays SET ended_at=? WHERE track_id=? AND ended_at IS NULL ORDER BY play_id DESC LIMIT 1",
+                (now, track_id),
+            )
 
 
 # ------------------------------
 # Queries for commands
 # ------------------------------
 
-def recent_plays(*, guild_id: int | str, limit: int = 10, include_autofill: bool = False):
+def recent_plays(*, guild_id: int | str, limit: int = 20, include_autofill: bool = False):
     conn = get_conn()
     where = "WHERE p.guild_id = ?"
     params = [str(guild_id)]
@@ -222,7 +225,7 @@ def recent_plays(*, guild_id: int | str, limit: int = 10, include_autofill: bool
         params,
     ).fetchall()
 
-def top_tracks(*, guild_id: int | str, since_seconds: Optional[int], limit: int = 10, include_autofill: bool = False):
+def top_tracks(*, guild_id: int | str, since_seconds: Optional[int], limit: int = 20, include_autofill: bool = False):
     conn = get_conn()
     params: list[Any] = [str(guild_id)]
     where = "WHERE p.guild_id = ?"
@@ -310,6 +313,7 @@ def get_user_like_count(*, track_id: str, guild_id: int | str, user_id: int | st
 def top_liked_for_users(*, guild_id: int | str, user_ids: Iterable[int | str], limit: int = 50) -> list[dict]:
     """Return top liked tracks for the given users in this guild, ordered by like count.
     Includes basic track metadata (title, artist, source_url) when available.
+    Excludes tracks with BOTH 'Unknown Title' and 'Unknown' artist.
     """
     user_ids = [str(u) for u in user_ids if u is not None]
     if not user_ids:
@@ -329,11 +333,47 @@ def top_liked_for_users(*, guild_id: int | str, user_ids: Iterable[int | str], l
         JOIN tracks t ON t.id = l.track_id
         WHERE l.guild_id = ?
           AND l.user_id IN ({placeholders})
+          AND NOT (
+            LOWER(COALESCE(t.title, '')) IN ('unknown title', 'untitled', '')
+            AND LOWER(COALESCE(t.artist, '')) IN ('unknown', 'unknown artist', '', 'none')
+          )
         GROUP BY l.track_id
         ORDER BY like_count DESC, last_liked_at DESC
         LIMIT ?
     """
     params = [str(guild_id)] + user_ids + [int(limit)]
     cur = conn.execute(sql, params)
+    rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+def get_user_liked_tracks_all_guilds(user_id: int | str) -> list[dict]:
+    """Get all tracks liked by a user across all guilds, grouped by track_id.
+    Returns tracks ordered by user's like count (most liked first).
+    Each track includes the user's personal like count.
+    Excludes tracks with 'Unknown Title' or 'Unknown' artist.
+    
+    Returns:
+        List of dicts with: track_id, user_like_count, title, artist, source_url
+    """
+    conn = get_conn()
+    sql = """
+        SELECT
+            l.track_id,
+            COUNT(*) AS user_like_count,
+            MAX(l.created_at) AS last_liked_at,
+            t.title,
+            t.artist,
+            t.source_url
+        FROM likes l
+        JOIN tracks t ON t.id = l.track_id
+        WHERE l.user_id = ?
+          AND NOT (
+            LOWER(COALESCE(t.title, '')) IN ('unknown title', 'untitled', '')
+            AND LOWER(COALESCE(t.artist, '')) IN ('unknown', 'unknown artist', '', 'none')
+          )
+        GROUP BY l.track_id
+        ORDER BY user_like_count DESC, last_liked_at DESC
+    """
+    cur = conn.execute(sql, (str(user_id),))
     rows = cur.fetchall()
     return [dict(row) for row in rows]

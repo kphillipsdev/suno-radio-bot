@@ -10,7 +10,7 @@ def fix_utf8_in_dict(data):
     Recursively fix UTF-8 encoding issues in dictionaries and lists.
     Fixes prompts and other string fields that may have been incorrectly encoded.
     """
-    from src.utils.song_scraper import fix_utf8_encoding
+    from src.utils.smart_scraper import fix_utf8_encoding
     
     if isinstance(data, dict):
         return {k: fix_utf8_in_dict(v) for k, v in data.items()}

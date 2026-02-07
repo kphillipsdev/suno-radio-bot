@@ -14,8 +14,9 @@ import codecs
 from typing import Dict, Optional
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# Turn off the logger by default as requested
+logger.disabled = True
 
 
 def clean_lyrics_text(text: str) -> str:

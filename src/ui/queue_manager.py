@@ -23,9 +23,9 @@ def _fmt_duration(seconds: Optional[int | float]) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def build_queue_embed(guild: discord.Guild, queue: Sequence[dict]) -> discord.Embed:
+def build_queue_embed(guild: discord.Guild, queue: Sequence[dict], current_page: int = 0, items_per_page: int = 12) -> discord.Embed:
     """
-    Build a compact queue embed for the current guild.
+    Build a compact queue embed for the current guild with pagination support.
     Expects each item in queue to be a dict with (at least):
       - title / author or artist
       - requester_mention / requester_name / requester_tag / requester_id
@@ -38,11 +38,19 @@ def build_queue_embed(guild: discord.Guild, queue: Sequence[dict]) -> discord.Em
             color=0x0099FF,
         )
 
+    # Convert to list to support slicing (deque doesn't support slicing)
+    queue_list = list(queue)
+    
+    total_items = len(queue_list)
+    total_pages = max(1, (total_items + items_per_page - 1) // items_per_page)
+    current_page = min(current_page, max(0, total_pages - 1))
+    
+    # Calculate start and end indices for current page
+    start_idx = current_page * items_per_page
+    end_idx = min(start_idx + items_per_page, total_items)
+    
     lines: list[str] = []
-    for idx, song in enumerate(queue, start=1):
-        if idx > MAX_LINES:
-            break
-
+    for idx, song in enumerate(queue_list[start_idx:end_idx], start=start_idx + 1):
         title_raw = (song.get("title") or "Untitled").strip()
         title = escape_markdown(title_raw)
 
@@ -68,16 +76,23 @@ def build_queue_embed(guild: discord.Guild, queue: Sequence[dict]) -> discord.Em
             f"by {artist} ({dur_str}) / Requested by {requester}"
         )
 
-    remaining = len(queue) - MAX_LINES
-    if remaining > 0:
-        lines.append(f"… and **{remaining}** more in queue")
-
+    description = "\n".join(lines) if lines else "No items on this page."
+    
     embed = discord.Embed(
         title=f"📋 Queue for {guild.name}",
-        description="\n".join(lines),
+        description=description,
         color=0x0099FF,
     )
-    embed.set_footer(text="Queue Manager Panel")
+    
+    # Add footer with page info
+    if total_pages > 1:
+        embed.set_footer(
+            text=f"Queue Manager Panel • Page {current_page + 1} of {total_pages} • "
+                 f"Showing items {start_idx + 1}-{end_idx} of {total_items}"
+        )
+    else:
+        embed.set_footer(text=f"Queue Manager Panel • Total: {total_items} item{'s' if total_items != 1 else ''}")
+    
     return embed
 
 
@@ -111,12 +126,19 @@ class QueueManagerView(discord.ui.View):
         self.on_timeout_callback = on_timeout_callback
 
         self.selected_index: Optional[int] = None  # 0-based index in queue
+        self.current_page = 0
+        self.items_per_page = 12
 
         # dynamic selects
         self.song_select: Optional[discord.ui.Select] = None
         self.pos_select: Optional[discord.ui.Select] = None
+        
+        # Store references to pagination buttons
+        self.previous_page_button: Optional[discord.ui.Button] = None
+        self.next_page_button: Optional[discord.ui.Button] = None
 
         self._build_selects()
+        self._update_page_buttons()
 
     # --- internal helpers ---------------------------------------------------
 
@@ -143,7 +165,12 @@ class QueueManagerView(discord.ui.View):
 
         # --- Song select (which song to edit) -------------------------------
         opts_song: list[discord.SelectOption] = []
-        for i, song in enumerate(items[:SELECT_MAX], start=1):
+        # Get songs from current page
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(items))
+        page_items = items[start_idx:end_idx]
+        
+        for i, song in enumerate(page_items, start=start_idx + 1):
             title = (song.get("title") or "Untitled").strip()
             if len(title) > 80:
                 title = title[:77] + "…"
@@ -171,8 +198,11 @@ class QueueManagerView(discord.ui.View):
                         self.selected_index = idx0
                     else:
                         self.selected_index = None
-                # just acknowledge without changing message
-                await interaction.response.defer()
+                # Refresh the message to update button states and show selection in placeholder
+                self._refresh_select_options()
+                self._update_page_buttons()
+                embed = build_queue_embed(self.guild, list(self.queue), self.current_page, self.items_per_page)
+                await interaction.response.edit_message(embed=embed, view=self)
 
             song_select.callback = song_select_cb
             self.song_select = song_select
@@ -253,19 +283,51 @@ class QueueManagerView(discord.ui.View):
         # --- refresh song_select -------------------------------------------
         if self.song_select is not None:
             opts_song: list[discord.SelectOption] = []
-            for i, song in enumerate(items[:SELECT_MAX], start=1):
+            selected_song_title = None
+            
+            # Get songs from current page
+            start_idx = self.current_page * self.items_per_page
+            end_idx = min(start_idx + self.items_per_page, len(items))
+            page_items = items[start_idx:end_idx]
+            
+            # Check if selected song is on current page
+            selected_on_page = (
+                self.selected_index is not None 
+                and start_idx <= self.selected_index < end_idx
+            )
+            
+            for i, song in enumerate(page_items, start=start_idx + 1):
                 title = (song.get("title") or "Untitled").strip()
                 if len(title) > 80:
                     title = title[:77] + "…"
                 label = f"{i}. {title}"
                 opts_song.append(discord.SelectOption(label=label, value=str(i - 1)))
+                
+                # Check if this is the selected song
+                if self.selected_index is not None and (i - 1) == self.selected_index:
+                    selected_song_title = title
+            
+            # If selected song is not on current page, get its title for placeholder
+            if not selected_on_page and self.selected_index is not None and self.selected_index < q_len:
+                selected_song = items[self.selected_index]
+                title_raw = (selected_song.get("title") or "Untitled").strip()
+                if len(title_raw) > 100:
+                    selected_song_title = title_raw[:97] + "…"
+                else:
+                    selected_song_title = title_raw
 
             if opts_song:
                 self.song_select.options = opts_song
+                # Update placeholder to show selected song if one is selected
+                if selected_song_title:
+                    self.song_select.placeholder = selected_song_title[:100]
+                else:
+                    self.song_select.placeholder = "Select song to edit"
             else:
                 self.song_select.options = [
                     discord.SelectOption(label="(queue empty)", value="0", default=True)
                 ]
+                self.song_select.placeholder = "Select song to edit"
 
         # --- refresh pos_select --------------------------------------------
         if self.pos_select is not None:
@@ -283,17 +345,38 @@ class QueueManagerView(discord.ui.View):
                     discord.SelectOption(label="(no slots)", value="0", default=True)
                 ]
 
+    def _update_page_buttons(self) -> None:
+        """Enable/disable pagination buttons based on current page."""
+        total_items = len(self.queue)
+        total_pages = max(1, (total_items + self.items_per_page - 1) // self.items_per_page)
+        self.current_page = min(self.current_page, max(0, total_pages - 1))
+        
+        # Find pagination buttons in children if not already stored
+        if self.previous_page_button is None or self.next_page_button is None:
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    if item.label == "⬅️":
+                        self.previous_page_button = item
+                    elif item.label == "➡️":
+                        self.next_page_button = item
+        
+        if self.previous_page_button is not None:
+            self.previous_page_button.disabled = (self.current_page == 0)
+        if self.next_page_button is not None:
+            self.next_page_button.disabled = (self.current_page >= total_pages - 1)
+    
     async def _sync_message(self, interaction: discord.Interaction) -> None:
         """Re-render the embed and refresh select options after queue changes."""
         if not self.message:
             return
         self._refresh_select_options()
-        embed = build_queue_embed(self.guild, list(self.queue))
+        self._update_page_buttons()
+        embed = build_queue_embed(self.guild, list(self.queue), self.current_page, self.items_per_page)
         await interaction.response.edit_message(embed=embed, view=self)
 
     # --- buttons -----------------------------------------------------------
 
-    @discord.ui.button(label="⬆ Move Up", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="⬆ Move Up", style=discord.ButtonStyle.primary, row=3)
     async def move_up(
         self,
         interaction: discord.Interaction,
@@ -320,7 +403,7 @@ class QueueManagerView(discord.ui.View):
 
         await self._sync_message(interaction)
 
-    @discord.ui.button(label="⬇ Move Down", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="⬇ Move Down", style=discord.ButtonStyle.primary, row=3)
     async def move_down(
         self,
         interaction: discord.Interaction,
@@ -346,7 +429,7 @@ class QueueManagerView(discord.ui.View):
 
         await self._sync_message(interaction)
 
-    @discord.ui.button(label="🗑 Remove Selected", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="🗑", style=discord.ButtonStyle.danger, row=3)
     async def remove_selected(
         self,
         interaction: discord.Interaction,
@@ -376,7 +459,41 @@ class QueueManagerView(discord.ui.View):
 
         await self._sync_message(interaction)
 
-    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary, row=2)
+    async def previous_page_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        """Navigate to previous page."""
+        if not self._is_authorized(interaction.user):
+            return await self._reject(interaction)
+        
+        if self.current_page > 0:
+            self.current_page -= 1
+            await self._sync_message(interaction)
+        else:
+            await interaction.response.defer()
+    
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary, row=2)
+    async def next_page_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        """Navigate to next page."""
+        if not self._is_authorized(interaction.user):
+            return await self._reject(interaction)
+        
+        total_items = len(self.queue)
+        total_pages = max(1, (total_items + self.items_per_page - 1) // self.items_per_page)
+        if self.current_page < total_pages - 1:
+            self.current_page += 1
+            await self._sync_message(interaction)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2)
     async def refresh(
         self,
         interaction: discord.Interaction,
