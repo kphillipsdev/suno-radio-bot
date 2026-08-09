@@ -1,27 +1,14 @@
 import os
-import re
 import json
 import logging
 import subprocess
 import requests
 import urllib.parse
-from typing import Optional, Dict, Tuple, List
-from bs4 import BeautifulSoup
+from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
-# Import extraction functions from smart scraper module
-from src.utils.smart_scraper import (
-    extract_song_id, fetch_song_data,
-    extract_lyrics, 
-    extract_style_prompt, 
-    extract_video_url,
-    extract_image_url,
-    extract_model_info,
-    extract_play_count,
-    extract_like_count,
-    extract_created_at
-)
+from src.utils.smart_scraper import extract_song_id, fetch_suno_song_info
 
 # yt-dlp based extractor for SoundCloud, Bandcamp, etc.
 from src.utils.ytdlp_extractor import (
@@ -36,22 +23,6 @@ from src.utils.image_cache import download_image
 # =========================
 # Duration helpers
 # =========================
-def _iso8601_to_seconds(s: str) -> Optional[int]:
-    if not s:
-        return None
-    s = s.strip().upper()
-    m = re.fullmatch(
-        r"P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<mins>\d+)M)?(?:(?P<secs>\d+)S)?)?",
-        s,
-    )
-    if not m:
-        return None
-    days = int(m.group("days") or 0)
-    hours = int(m.group("hours") or 0)
-    mins = int(m.group("mins") or 0)
-    secs = int(m.group("secs") or 0)
-    return days * 86400 + hours * 3600 + mins * 60 + secs
-
 def _ffprobe_duration(url_or_path: str, headers: Dict | None = None, timeout: int = 7) -> Optional[int]:
     try:
         hdr_str = None
@@ -222,209 +193,62 @@ def _extract_direct_media_info(url: str) -> dict:
     }
 
 # =========================
-# Static (requests + BS4 + JSON scraping)
-# =========================
-
-_AUDIO_RE = re.compile(r"https?://(?:cdn\d?|static)\.suno\.ai/[A-Za-z0-9\-_]+\.mp3", re.I)
-
-def _safe_json_loads(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-def _extract_from_ld_json(soup: BeautifulSoup) -> dict:
-    out = {"duration": None}
-    for script in soup.find_all("script", type="application/ld+json"):
-        data = _safe_json_loads(script.string or "")
-        if not data:
-            continue
-        objs = data if isinstance(data, list) else [data]
-        for obj in objs:
-            d = obj.get("duration")
-            sec = _iso8601_to_seconds(d) if d else None
-            if sec:
-                out["duration"] = sec
-    return out
-
-
-def _extract_audio_url_from_meta_or_html(soup: BeautifulSoup, raw_html: str, song_id: Optional[str]) -> Optional[str]:
-    # Primary: construct the CDN URL directly from the song UUID.
-    # This is the most reliable method — Suno's CDN consistently serves
-    # audio at cdn1.suno.ai/{uuid}.mp3.
-    if song_id:
-        # Use cdn1.suno.ai for the audio file
-        return f"https://cdn1.suno.ai/{song_id}.mp3"
-
-    # Fallback: scan inline script JSON for a real song mp3 URL
-    # (skip Suno utility/silence files like sil-100.mp3)
-    _SUNO_UTILITY_RE = re.compile(r"/sil-\d+\.mp3", re.I)
-    for m in _AUDIO_RE.finditer(raw_html or ""):
-        candidate = m.group(0)
-        if not _SUNO_UTILITY_RE.search(candidate):
-            return candidate
-
-    return None
-
-
-
-# =========================
 # Main extraction
 # =========================
 
 def extract_song_info(url: str) -> dict:
-    """Extract rich song metadata and a playable audio URL, Playwright-free."""
+    """Extract rich song metadata and a playable audio URL (Suno via clip API)."""
     os.makedirs("songs", exist_ok=True)
-    
+
     # Handle direct media URLs first (mp3, wav, ogg, m4a, flac, mp4, webm, etc.)
     if _is_direct_media_url(url):
         return _extract_direct_media_info(url)
-    
+
     url = _normalize_suno_short(url)
 
-    # Prefer Suno page path
-    if "suno.com/song/" in url:
+    # Suno: studio clip API only
+    song_id = extract_song_id(url)
+    if song_id or "suno.com" in (url or "").lower():
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            raw_html = response.text
-            # Try lxml first (faster), fall back to html.parser (always available)
-            try:
-                soup = BeautifulSoup(raw_html, 'lxml')
-            except Exception:
-                soup = BeautifulSoup(raw_html, 'html.parser')
+            info = fetch_suno_song_info(url)
+            song_id = info.get("song_id") or song_id
 
-            # Title
-            title_meta = soup.find("meta", property="og:title")
-            title = title_meta.get("content", "Unknown Title") if title_meta else "Unknown Title"
-
-            # Artist (strict): take the text after the LAST "by " that appears before "(@"
-            artist = None
-            t_creator = soup.find("meta", attrs={"name": "description"})
-            if t_creator and t_creator.get("content"):
-                c = t_creator["content"]
-                h = re.search(r"\(\@", c)  # start of "(@handle"
-                if h:
-                    pre = c[:h.start()]  # everything before the handle block
-                    by_hits = list(re.finditer(r"\bby\s+", pre, flags=re.IGNORECASE))
-                    if by_hits:
-                        start = by_hits[-1].end()  # after the *last* "by "
-                        artist = pre[start:].strip()  # exact slice; keeps emojis/specials intact
-
-            # (optional) fallback: pull from /@handle link if no artist found
-            if not artist:
-                a = soup.find("a", href=re.compile(r"^/@.+$"))
-                if a and a.has_attr("href"):
-                    m = re.search(r"^/@(.+)$", a["href"])
-                    artist = (m.group(1).strip() if m else a.get_text(strip=True)) or None
-
-            # Song ID
-            song_id = None
-            m_id = re.search(r"suno\.com/song/([a-f0-9\-]{8,})", url, re.I)
-            if m_id:
-                song_id = m_id.group(1)
-
-            # Thumbnail
-            thumbnail = None
-            og_img = soup.find("meta", property="og:image")
-            if og_img and og_img.get("content"):
-                thumbnail = og_img["content"].strip()
-
-            # Date
-            created_date = None
-            date_meta = soup.find("meta", attrs={"property": "article:published_time"})
-            if date_meta and date_meta.get("content"):
-                created_date = date_meta["content"].strip()
-
-            # Duration from meta/ld+json
-            duration = None
-            meta_dur = (
-                soup.find("meta", attrs={"property": "music:duration"})
-                or soup.find("meta", attrs={"property": "og:video:duration"})
-            )
-            if meta_dur and meta_dur.get("content"):
-                try:
-                    duration = int(float(meta_dur["content"]))
-                except Exception:
-                    duration = None
-            if duration is None:
-                ld = _extract_from_ld_json(soup)
-                duration = ld.get("duration") or duration
-
-
-            _api_data = None
-            if song_id:
-                _api_data = fetch_song_data(song_id)
-
-            lyrics = extract_lyrics(soup, raw_html, _data=_api_data)
-            prompt = extract_style_prompt(soup, raw_html, _data=_api_data)
-            video_url = extract_video_url(soup, raw_html, _data=_api_data)
-            image_url = extract_image_url(soup, raw_html, _data=_api_data)
-            model_info = extract_model_info(soup, raw_html, _data=_api_data)
-            play_count = extract_play_count(soup, raw_html, _data=_api_data)
-            like_count = extract_like_count(soup, raw_html, _data=_api_data)
-            created_at = extract_created_at(soup, raw_html, _data=_api_data)
-
-            # Audio URL (meta -> html regex -> construct)
-            audio_url = _extract_audio_url_from_meta_or_html(soup, raw_html, song_id)
-            if not audio_url:
-                raise ValueError("Could not extract Suno audio URL")
-
-            # If duration still unknown, probe the audio
-            if duration is None and audio_url:
+            # If API omitted duration, probe the audio as a last resort
+            if info.get("duration") is None and info.get("url"):
                 try:
                     headers_ff = {
-                        "User-Agent": headers["User-Agent"],
-                        "Referer": f"https://suno.com/song/{song_id}" if song_id else "https://suno.com/",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": info.get("suno_url") or "https://suno.com/",
                         "Accept": "*/*",
                     }
-                    duration = _ffprobe_duration(audio_url, headers=headers_ff)
+                    info["duration"] = _ffprobe_duration(info["url"], headers=headers_ff)
                 except Exception:
-                    duration = None
-            if duration is None and audio_url:
-                try:
-                    duration = _yt_dlp_probe_duration(audio_url)
-                except Exception:
-                    duration = None
+                    pass
+                if info.get("duration") is None:
+                    try:
+                        info["duration"] = _yt_dlp_probe_duration(info["url"])
+                    except Exception:
+                        pass
 
-            # Download and cache the thumbnail image locally
-            local_thumbnail = None
+            thumbnail = info.get("thumbnail") or info.get("image_url")
             if thumbnail:
                 try:
-                    local_thumbnail = download_image(
+                    info["local_thumbnail"] = download_image(
                         thumbnail,
                         song_id=song_id,
-                        referer=f"https://suno.com/song/{song_id}" if song_id else "https://suno.com/"
+                        referer=info.get("suno_url") or "https://suno.com/",
                     )
                 except Exception:
-                    pass  # Fallback to external URL if download fails
+                    pass
 
-            return {
-                "title": title,
-                "url": audio_url,
-                "duration": duration,
-                "date": created_date,
-                "artist": artist,
-                "suno_url": f"https://suno.com/song/{song_id}" if song_id else url,
-                "thumbnail": thumbnail,
-                "local_thumbnail": local_thumbnail,  # New field for cached image
-                "video_url": video_url,
-                "prompt": prompt,
-                "lyrics": lyrics,
-                "image_url": image_url,
-                "major_model_version": model_info.get("major_model_version"),
-                "model_name": model_info.get("model_name"),
-                "play_count": play_count,
-                "like_count": like_count,
-                "created_at": created_at,
-            }
+            # Drop helper-only keys before returning to callers
+            info.pop("song_id", None)
+            info.pop("handle", None)
+            return info
 
         except Exception as e:
-            logger.error("Suno direct extraction failed for %s: %s", url, e)
-            raise  # Re-raise so it can be handled by the caller
+            logger.error("Suno API extraction failed for %s: %s", url, e)
+            raise
 
     # Try yt-dlp for other platforms (SoundCloud, Bandcamp, Mixcloud, etc.)
     if is_ytdlp_supported_url(url):

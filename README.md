@@ -6,7 +6,7 @@ A self-hosted Discord music bot built for **Suno AI radio**: continuous autofill
 
 ## Highlights
 
-- **Suno-first playback** — play songs, playlists, and profiles from Suno links; scrape title, artist, prompts, and lyrics when available
+- **Suno-first playback** — play songs, playlists, and profiles from Suno links; metadata (title, artist, prompts, lyrics) comes from the Suno clip API
 - **Idle radio (autofill)** — when the queue empties, pull the next batch from a CSV seed list, a Suno URL, and/or liked tracks
 - **Song requests** — `/request`, `/myrequests`, `/unrequest` (and `!` equivalents) for community autofill submissions
 - **Queue & voice** — play, skip, shuffle, remove, volume, join/leave; rich Now Playing cards with interactive controls
@@ -175,7 +175,7 @@ Serves public stats plus personal stats behind Discord OAuth. The app opens the 
 
 - **discord.py** — bot + voice
 - **yt-dlp** — YouTube / SoundCloud / generic URLs
-- **BeautifulSoup / custom scrapers** — Suno metadata & playlists
+- **Suno studio clip/playlist APIs** — song metadata & playlist enqueue
 - **SQLite** — play history, likes, contests
 - **FFmpeg** — Discord audio pipeline
 - **FastAPI + uvicorn** — optional Wrapped dashboard
