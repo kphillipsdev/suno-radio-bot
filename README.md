@@ -2,8 +2,6 @@
 
 A self-hosted Discord music bot built for **Suno AI radio**: continuous autofill playback, song requests, anonymous contests, guessing games, and play stats — with YouTube / SoundCloud support via `yt-dlp`.
 
-This repo matches the live **SubotLive** deployment.
-
 ---
 
 ## Highlights
