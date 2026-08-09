@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=katie
-Group=katie
+User=
+Group=
 WorkingDirectory=/opt/SubotLive
 ExecStart=/opt/SubotLive/venv/bin/uvicorn web.app:app --host 127.0.0.1 --port 8100 --workers 1
 Restart=always
