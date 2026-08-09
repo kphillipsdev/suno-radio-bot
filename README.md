@@ -113,7 +113,7 @@ python dev.py
 python run.py
 ```
 
-Example systemd units live under [`docs/`](docs/) (`subot-live.service`, `subot-web.service`).
+Example systemd units live under [`docs/`](docs/).
 
 ---
 
@@ -145,7 +145,7 @@ Never commit `.env`. Runtime data (DB, `data/`, `images/`, `logs/`, autofill CSV
 uvicorn web.app:app --host 127.0.0.1 --port 8100
 ```
 
-Serves public stats plus personal stats behind Discord OAuth. The app opens the bot DB **read-only** (WAL-safe alongside the bot process). See `docs/subot-web.service` and `docs/radio.vectorsofstars.ca.conf` for a production reverse-proxy example.
+Serves public stats plus personal stats behind Discord OAuth. The app opens the bot DB **read-only** (WAL-safe alongside the bot process). See `docs/subot-web.service` for a sample unit file.
 
 ---
 
@@ -155,7 +155,7 @@ Serves public stats plus personal stats behind Discord OAuth. The app opens the 
 ├── run.py / dev.py          # Entrypoints
 ├── requirements.txt         # Python deps
 ├── .env.example             # Config template (no secrets)
-├── docs/                    # systemd + nginx examples
+├── docs/                    # example systemd unit files
 ├── web/                     # FastAPI Wrapped dashboard
 └── src/
     ├── bot.py               # Bot bootstrap, cog loading
