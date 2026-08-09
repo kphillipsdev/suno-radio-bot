@@ -1,15 +1,18 @@
 import os
 import re
-import html
 import json
+import logging
 import subprocess
 import requests
 import urllib.parse
 from typing import Optional, Dict, Tuple, List
 from bs4 import BeautifulSoup
 
+logger = logging.getLogger(__name__)
+
 # Import extraction functions from smart scraper module
 from src.utils.smart_scraper import (
+    extract_song_id, fetch_song_data,
     extract_lyrics, 
     extract_style_prompt, 
     extract_video_url,
@@ -21,7 +24,11 @@ from src.utils.smart_scraper import (
 )
 
 # yt-dlp based extractor for SoundCloud, Bandcamp, etc.
-from src.utils.ytdlp_extractor import extract_with_ytdlp, is_ytdlp_supported_url
+from src.utils.ytdlp_extractor import (
+    extract_with_ytdlp,
+    is_ytdlp_supported_url,
+    YtDlpExtractionError,
+)
 
 # Import image caching utility
 from src.utils.image_cache import download_image
@@ -218,8 +225,6 @@ def _extract_direct_media_info(url: str) -> dict:
 # Static (requests + BS4 + JSON scraping)
 # =========================
 
-# Looser URL finds in inline JSON/HTML (kept conservative)
-_SONG_URL_RE = re.compile(r"https?://(?:www\.)?suno\.com/song/([a-f0-9\-]{8,})", re.I)
 _AUDIO_RE = re.compile(r"https?://(?:cdn\d?|static)\.suno\.ai/[A-Za-z0-9\-_]+\.mp3", re.I)
 
 def _safe_json_loads(s: str):
@@ -244,27 +249,20 @@ def _extract_from_ld_json(soup: BeautifulSoup) -> dict:
 
 
 def _extract_audio_url_from_meta_or_html(soup: BeautifulSoup, raw_html: str, song_id: Optional[str]) -> Optional[str]:
-    # Preferred: meta tags
-    audio_meta = soup.find("meta", property="og:audio")
-    if audio_meta and audio_meta.get("content"):
-        url = audio_meta["content"].strip()
-        if url:
-            return url
-
-    tw_stream = soup.find("meta", attrs={"name": "twitter:player:stream"})
-    if tw_stream and tw_stream.get("content"):
-        url = tw_stream["content"].strip()
-        if url:
-            return url
-
-    # Fallback: mp3 link present in HTML/JSON
-    m = _AUDIO_RE.search(raw_html or "")
-    if m:
-        return m.group(0)
-
-    # Construct from song id if available
+    # Primary: construct the CDN URL directly from the song UUID.
+    # This is the most reliable method — Suno's CDN consistently serves
+    # audio at cdn1.suno.ai/{uuid}.mp3.
     if song_id:
+        # Use cdn1.suno.ai for the audio file
         return f"https://cdn1.suno.ai/{song_id}.mp3"
+
+    # Fallback: scan inline script JSON for a real song mp3 URL
+    # (skip Suno utility/silence files like sil-100.mp3)
+    _SUNO_UTILITY_RE = re.compile(r"/sil-\d+\.mp3", re.I)
+    for m in _AUDIO_RE.finditer(raw_html or ""):
+        candidate = m.group(0)
+        if not _SUNO_UTILITY_RE.search(candidate):
+            return candidate
 
     return None
 
@@ -357,16 +355,18 @@ def extract_song_info(url: str) -> dict:
                 duration = ld.get("duration") or duration
 
 
-            lyrics = extract_lyrics(soup, raw_html)
-            prompt = extract_style_prompt(soup, raw_html)
-            video_url = extract_video_url(soup, raw_html)
-            
-            # Extract additional information
-            image_url = extract_image_url(soup, raw_html)
-            model_info = extract_model_info(soup, raw_html)
-            play_count = extract_play_count(soup, raw_html)
-            like_count = extract_like_count(soup, raw_html)
-            created_at = extract_created_at(soup, raw_html)
+            _api_data = None
+            if song_id:
+                _api_data = fetch_song_data(song_id)
+
+            lyrics = extract_lyrics(soup, raw_html, _data=_api_data)
+            prompt = extract_style_prompt(soup, raw_html, _data=_api_data)
+            video_url = extract_video_url(soup, raw_html, _data=_api_data)
+            image_url = extract_image_url(soup, raw_html, _data=_api_data)
+            model_info = extract_model_info(soup, raw_html, _data=_api_data)
+            play_count = extract_play_count(soup, raw_html, _data=_api_data)
+            like_count = extract_like_count(soup, raw_html, _data=_api_data)
+            created_at = extract_created_at(soup, raw_html, _data=_api_data)
 
             # Audio URL (meta -> html regex -> construct)
             audio_url = _extract_audio_url_from_meta_or_html(soup, raw_html, song_id)
@@ -423,15 +423,19 @@ def extract_song_info(url: str) -> dict:
             }
 
         except Exception as e:
-            print(f"Suno direct extraction failed: {e}")
-            raise  # Re-raise the exception so it can be handled by the caller
-    
+            logger.error("Suno direct extraction failed for %s: %s", url, e)
+            raise  # Re-raise so it can be handled by the caller
+
     # Try yt-dlp for other platforms (SoundCloud, Bandcamp, Mixcloud, etc.)
     if is_ytdlp_supported_url(url):
+        # extract_with_ytdlp now raises YtDlpExtractionError on failure with a
+        # human-readable message, which we let propagate up to the caller so
+        # the user sees the real reason instead of "Unsupported URL format".
         result = extract_with_ytdlp(url)
         if result:
             return result
-        # If yt-dlp extraction failed, fall through to error
-    
-    # If nothing worked, raise an error
+        # Shouldn't happen anymore, but keep the safety net.
+        raise YtDlpExtractionError(f"yt-dlp returned no result for {url}")
+
+    # Truly unrecognized URL
     raise ValueError(f"Unsupported URL format: {url}")

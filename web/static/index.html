@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SunoRadio Wrapped</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="icon" type="image/jpeg" href="/static/assets/logo.jpg" />
+  <meta name="theme-color" content="#0a0a0f" />
+  <meta name="description" content="SunoRadio listening stats &amp; personal Wrapped" />
+</head>
+<body>
+
+  <!-- ── Header ─────────────────────────────────────────────────────── -->
+  <header>
+    <div class="container">
+      <a class="logo" href="/"><img src="/static/assets/logo.jpg" alt="" class="logo-img" />suno<span>radio wrapped</span></a>
+      <div id="auth-area">
+        <a href="/auth/login" class="auth-btn">Log in with Discord</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Now Playing (persistent, outside main) ──────────────────── -->
+  <div id="now-playing-bar" class="now-playing-bar" style="display:none">
+    <div class="container now-playing-inner">
+      <img id="np-cover" class="np-cover" src="" alt="" />
+      <div class="np-info">
+        <div class="np-label">Now Playing</div>
+        <div id="np-title" class="np-title"></div>
+        <div id="np-artist" class="np-artist"></div>
+      </div>
+      <div class="np-actions">
+        <span id="np-requester" class="np-requester"></span>
+        <a id="np-join" class="auth-btn" href="#" target="_blank" style="display:none">Join Radio</a>
+      </div>
+    </div>
+  </div>
+
+  <main class="container">
+
+    <!-- ── Tabs + autofill toggle ────────────────────────────────── -->
+    <div class="top-controls">
+      <div class="tabs">
+        <button class="tab active" data-tab="public">Server Stats</button>
+        <button class="tab" data-tab="wrapped" id="wrapped-tab" style="display:none">My Wrapped</button>
+      </div>
+      <label class="toggle-label" title="Include autofill/radio plays">
+        <input type="checkbox" id="autofill-toggle" />
+        <span class="toggle-slider"></span>
+        <span class="toggle-text">Autofill</span>
+      </label>
+    </div>
+
+    <!-- ── Public section ─────────────────────────────────────────── -->
+    <section class="public-section active">
+
+      <!-- Overview cards -->
+      <div class="stat-grid" id="overview-grid">
+        <div class="loading"><div class="spinner"></div></div>
+      </div>
+
+      <!-- Top Tracks -->
+      <div class="section-title">
+        <span class="icon">🏆</span> Top Tracks
+        <select class="range-select" id="range-select">
+          <option value="all">All Time</option>
+          <option value="year">This Year</option>
+          <option value="month">This Month</option>
+          <option value="week">This Week</option>
+          <option value="day">Today</option>
+        </select>
+      </div>
+      <ul class="track-list" id="top-tracks-list">
+        <li class="loading"><div class="spinner"></div></li>
+      </ul>
+
+      <!-- Top DJs -->
+      <div class="section-title"><span class="icon">🎧</span> Top DJs <button type="button" class="view-all-btn" id="view-all-djs-btn">View all DJs</button></div>
+      <ul class="dj-list" id="top-djs-list">
+        <li class="loading"><div class="spinner"></div></li>
+      </ul>
+      <div id="all-djs-section" class="all-section" style="display:none">
+        <ul class="dj-list" id="all-djs-list"></ul>
+        <div class="pagination" id="all-djs-pagination"></div>
+      </div>
+
+      <!-- Activity Heatmap -->
+      <div class="section-title"><span class="icon">📊</span> Listening Activity</div>
+      <div class="heatmap-container">
+        <div class="heatmap" id="heatmap">
+          <div class="loading"><div class="spinner"></div></div>
+        </div>
+      </div>
+
+      <!-- Top Liked -->
+      <div class="section-title"><span class="icon">♥</span> Most Saved Tracks <button type="button" class="view-all-btn" id="view-all-liked-btn">View all</button></div>
+      <ul class="track-list" id="top-liked-list">
+        <li class="loading"><div class="spinner"></div></li>
+      </ul>
+      <div id="all-liked-section" class="all-section" style="display:none">
+        <ul class="track-list" id="all-liked-list"></ul>
+        <div class="pagination" id="all-liked-pagination"></div>
+      </div>
+
+    </section>
+
+    <!-- ── Wrapped section (personal) ─────────────────────────────── -->
+    <section class="wrapped-section">
+      <div class="login-prompt">
+        <h2>Your Wrapped</h2>
+        <p>Log in with Discord to see your personal listening stats.</p>
+        <a href="/auth/login" class="auth-btn">Log in with Discord</a>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <div class="container">SunoRadio Wrapped &middot; Powered by your listening history</div>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

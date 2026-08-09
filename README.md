@@ -1,384 +1,168 @@
-# Suno Radio Bot
+# Discord Music Bot
 
-A self-hosted Discord music bot tuned for **Suno AI “radio”** style playback.  
-It can spin up a continuous station from Suno links, CSVs, or profiles, while also handling normal YouTube/SoundCloud queues.
+A feature-rich Discord bot for music playback, voice announcements, and Suno integration.
 
----
+## Features
 
-## ✨ Highlights
+- 🎵 **Music Playback**: Play music from YouTube and SoundCloud
+- 📋 **Queue Management**: Add, remove, skip, shuffle, and view songs
+- 🔊 **Voice Control**: Volume adjustment, join/leave voice channels
+- 📂 **Playlists**: Create, load, and manage custom playlists
+- 🎤 **Text-to-Speech**: Voice announcements with native macOS TTS
+- 🔗 **Suno Integration**: Map users to Suno usernames and add their music
+- 💾 **Persistent Data**: Automatic saving/loading of queues and playlists
+- 🎛️ **Controls Interface**: Interactive buttons for playback control
 
-- **Suno-first playback**
-  - Plays Suno songs from direct links, playlists, and profiles
-  - Scrapes metadata (title, artist, prompts, lyrics where available)
-- **Normal music support**
-  - Falls back to `yt-dlp` for YouTube / generic URLs
-- **Smart queues & playlists**
-  - Per-guild queues
-  - Named playlists you can create, load, and manage
-- **Radio / Autofill mode**
-  - When the queue runs dry, the bot can auto-enqueue tracks from:
-    - A default Suno URL (playlist/profile/song)
-    - A CSV of tracks
-    - Or per-user liked tracks
-- **Likes & play history**
-  - Tracks unique plays per guild in SQLite
-  - Like/unlike system for tracks, plus “top” views
-  - Slash and prefix commands for history & stats
-- **Rich Now Playing cards**
-  - Safe embeds with title, artist, duration, requestor, and up-next preview
-  - Links back to the Suno page when possible
-- **TTS test helper (optional)**
-  - macOS-focused TTS via NSSpeechSynthesizer
-  - gTTS + ffmpeg fallback where available
-- **Slash + prefix commands**
-  - `/play`, `/top`, `/history` etc.
-  - `!play`, `!queue`, `!history`, `!top`, `!help`, and more
-  - Auto-updating help embeds that hide admin-only commands
+## Commands
 
----
+### Voice Commands
+- `!join [channel]` - Join your voice channel
+- `!leave` - Leave current voice channel
+- `!create_music_channel` - Create and join #music (admin only)
+- `!test_speak` - Play a test TTS message
 
-## 🚀 Quick Start
+### Queue Commands
+- `!play <url>` - Add song to queue from URL
+- `!queue` - Show current queue
+- `!skip` - Skip current song
+- `!stop` - Stop and clear queue
+- `!shuffle` - Shuffle queue
+- `!volume <0-200>` - Set volume (100 = default)
+
+### Playlist Commands
+- `!playlist_create <name>` - Create playlist
+- `!playlist_add <name> <url>` - Add song to playlist
+- `!playlist_delete <name>` - Delete playlist
+- `!load_playlist <name>` - Load playlist to queue
+
+### Suno Integration
+- `!add_user <@user> <suno_username>` - Map Discord user to Suno
+- `!add_user_songs <suno_username>` - Add Suno's songs to default playlist
+
+### Admin Commands
+- `!reload` - Reload music cog (admin only)
+
+## Installation
 
 ### Prerequisites
+- Python 3.8+
+- FFmpeg (externally installed)
+- macOS (recommended for full TTS support)
 
-- **Python** 3.11+
-- **FFmpeg** installed on your system (for audio)
-- A **Discord application & bot token**
-- (Recommended) A virtualenv
+### Setup
+1. **Clone the repository**
+   ```bash
+   git clone <repository-url>
+   cd discord-music-bot
+   ```
 
-### 1. Clone the repo
+2. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-git clone https://github.com/kphillipsdev/suno-radio-bot.git
-cd suno-radio-bot
-```
+3. **Configure environment**
+   Copy the template (**no secrets in git**):
+   ```bash
+   cp .env.example .env
+   ```
+   Edit `.env` and set `BOT_TOKEN` (and any other vars you use). Never commit `.env`; keep Discord tokens only on the machine that runs the bot.
 
-### 2. Create & activate a virtualenv (optional but recommended)
+4. **Get a Discord bot token**
+   - Go to [Discord Developer Portal](https://discord.com/developers/applications)
+   - Create a new application
+   - Go to Bot section and create a bot
+   - Copy the token to `.env`
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
+5. **Invite the bot**
+   - Go to OAuth2 → URL Generator
+   - Select scopes: `bot`, `applications.commands`
+   - Permissions: `Send Messages`, `Use Slash Commands`, `Connect`, `Speak`
+   - Use the generated URL to invite the bot
 
-### 3. Install dependencies
+### FFmpeg Setup
+The bot requires FFmpeg for audio processing:
 
-```bash
-pip install -r requirements.txt
-```
-
-Dependencies include:
-
-- `discord.py[voice]`
-- `python-dotenv`
-- `yt-dlp`
-- `beautifulsoup4`
-- `requests`
-- `watchfiles` (for `dev.py` hot-reload)
-- Optional TTS libraries (`pyobjc`, `gTTS`) if you want the TTS helper
-
-### 4. Configure environment
-
-Create a `.env` file in the repo root:
-
-```env
-BOT_TOKEN=your_discord_bot_token_here
-
-# Optional: SQLite DB path (defaults to ./suno_radio.db)
-SUNO_RADIO_DB=./suno_radio.db
-
-# Optional: radio/autofill behaviour
-# DEFAULT_AUTOFILL_URL=https://suno.com/@your-handle
-# DEFAULT_AUTOFILL_CSV=/absolute/path/to/tracks.csv
-# AUTOFILL_FEATURE=1
-# AUTOFILL_DELAY_SEC=30
-# AUTOFILL_MAX_PULL=50
-# AUTOFILL_LIKES_PER_USER=5
-
-# Optional: prefetch controls (see Config section)
-# PREFETCH_MODE=full
-# PREFETCH_DIR=songs
-# PREFETCH_BYTES=524288
-# PREFETCH_TIMEOUT=25
-```
-
-#### Getting a Discord bot token
-
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-2. Create a new application → add a **Bot**
-3. Copy the **bot token** into `BOT_TOKEN` in your `.env`
-
-#### Invite the bot to your server
-
-In the Developer Portal:
-
-1. Go to **OAuth2 → URL Generator**
-2. Scopes:
-   - `bot`
-   - `applications.commands`
-3. Bot permissions:
-   - Send Messages
-   - Use Slash Commands
-   - Connect
-   - Speak
-   - Use Voice Activity
-   - Manage Channels (for `create_music_channel`)
-4. Use the generated URL to invite the bot
-
-### 5. FFmpeg install (examples)
-
-**macOS (Homebrew):**
-
+**macOS (with Homebrew):**
 ```bash
 brew install ffmpeg
 ```
 
-**Ubuntu/Debian:**
-
+**Linux:**
 ```bash
-sudo apt update
 sudo apt install ffmpeg
 ```
 
 **Windows:**
+Download from [ffmpeg.org](https://ffmpeg.org/download.html)
 
-Download from [ffmpeg.org](https://ffmpeg.org/) and ensure it’s on your `PATH`.
+## Running the Bot
 
----
-
-## ▶️ Running the Bot
-
-### Development (auto-reload on code changes)
-
+### Development
 ```bash
 python dev.py
 ```
 
-`dev.py` will:
-
-- Run `run.py`
-- Watch the `src/` folder for `.py` changes
-- Restart the bot when files change
-
 ### Production
-
 ```bash
 python run.py
 ```
 
-`run.py`:
+## Configuration
 
-- Loads `.env`
-- Initializes the SQLite DB
-- Starts the bot with the `BOT_TOKEN`
+### Voice Settings
+- **Opus Compression**: Automatically detected; falls back to raw PCM if needed
+- **Volume**: Adjustable per guild (0-200%)
+- **Voice Channels**: Auto-joins user's channel
 
-You can wrap `run.py` in a systemd service, pm2, Docker, etc.
+### Data Storage
+- Guild data saved in JSON files in `data/` directory
+- Automatic persistence of queues, playlists, and user mappings
 
----
+## Development
 
-## 🧠 Core Concepts
-
-### Storage
-
-There are two layers of persistence:
-
-1. **Guild JSON files** (`data/guild_{guild_id}.json`)
-   - Per-guild queues
-   - Named playlists
-   - User → Suno mappings
-
-2. **SQLite DB** (`SUNO_RADIO_DB`, default `./suno_radio.db`)
-   - `tracks`: track metadata (id, title, artist, source_url, etc.)
-   - `plays`: play history per guild, with timestamps
-   - `likes`: per-user likes for tracks
-
-This allows you to:
-
-- Keep queues and playlists across restarts
-- See recent plays per guild
-- Query “top” tracks over a time range
-- Build “liked radio” modes per listener
-
----
-
-## 🎛 Configuration
-
-Most tunables are driven by environment variables. All of these are optional – defaults are chosen to be reasonable for most servers.
-
-### Required
-
-- `BOT_TOKEN` – Discord bot token
-
-### Storage
-
-- `SUNO_RADIO_DB` – Path to the SQLite DB file  
-  Defaults to `./suno_radio.db` in the repo root.
-
-### Prefetch / Caching
-
-Used to warm up or fully cache audio before playback:
-
-- `PREFETCH_MODE` – `none` | `warmup` | `full`
-- `PREFETCH_DIR` – directory for cached audio (`songs` by default)
-- `PREFETCH_BYTES` – max bytes to pull in “warmup” mode
-- `PREFETCH_TIMEOUT` – HTTP timeout for full downloads
-
-### Playback / FFmpeg tuning
-
-Fine-tune startup latency and quality:
-
-- `PREBUFFER_SECONDS` – delay before starting playback (buffer fill)
-- `FADE_IN_SECONDS`, `FADE_IN_STEPS` – smooth fade-in
-- `FADE_OUT_SECONDS`, `FADE_OUT_STEPS` – smooth fade-out
-- `FFMPEG_PROBESIZE`, `FFMPEG_ANALYZEDURATION`
-- `FFMPEG_THREAD_QUEUE_SIZE`
-- `FFMPEG_RW_TIMEOUT_US`
-- `FFMPEG_NOBUFFER`
-- `FFMPEG_BUFFER_SIZE`
-- `FFMPEG_MAX_DELAY_US`
-- `VOICE_BITRATE_KBPS` – Discord voice bitrate
-
-### Queue & Autofill
-
-- `QUEUE_LIMIT_DEFAULT_ENABLED` – enable per-add throttling
-- `QUEUE_LIMIT_MAX_PER_ADD` – max tracks one command can enqueue
-- `QUEUE_MAX_PER_USER` – max tracks per user in queue
-- `AUTOFILL_FEATURE` – enable idle radio / autofill
-- `AUTOFILL_DELAY_SEC` – seconds to wait after “queue empty” before filling
-- `AUTOFILL_MAX_PULL` – how many tracks to enqueue per autofill
-- `DEFAULT_AUTOFILL_URL` – default Suno URL to pull from
-- `DEFAULT_AUTOFILL_CSV` – CSV to seed autofill when URL isn’t defined
-- `AUTOFILL_LIKES_PER_USER` – how many liked tracks to sample per user
-- `REMOVE_NP_AFTER_SONGS` – how many subsequent songs before pruning old Now Playing cards (autofill only)
-
----
-
-## 🕹 Commands Overview
-
-**Tip:** The bot has a custom `!help` that:
-
-- Auto-discovers commands
-- Splits large lists into multiple embed fields
-- Hides admin-only commands unless you use `!help admin`
-
-Below is an overview – always trust `!help` for the latest signatures.
-
-### Voice / Session
-
-- `!join [channel]` – Join your voice channel
-- `!leave` – Leave the current voice channel
-- `!create_music_channel` – Create & join a `#music` channel (admin-only)
-- `!test_speak` – Play a test TTS message in the voice channel
-
-### Queue
-
-- `!play <url or search>` – Add a song to the queue  
-  - Supports Suno links and generic URLs (YouTube, etc.)
-- `!queue` – Show current queue
-- `!skip` – Skip the current track
-- `!stop` – Stop playback and (optionally) clear queue
-- `!shuffle` – Shuffle the queue
-- `!volume <0-200>` – Set volume (100 = default)
-
-### Playlists
-
-- `!playlist_create <name>`
-- `!playlist_add <name> <url>`
-- `!playlist_delete <name>`
-- `!load_playlist <name>`
-
-### Suno Integration
-
-- `!add_user <@discord_user> <suno_username>` – Map a Discord user to a Suno handle
-- `!add_user_songs <suno_username>` – Pull that user’s Suno songs into a default playlist
-
-### Stats & History
-
-Slash commands and prefix pairs:
-
-- `/history [limit]` / `!history [limit]`  
-  Show recent radio plays for this server.
-
-- `/top [range] [limit]` / `!top [range] [limit]`  
-  Show top tracks for a time window: `day`, `week`, `month`, or `all`.
-
-- `/history_clear [scope]` / `!history_clear [scope]`  
-  Admin-only: clear history for the guild or for all data.
-
-### Likes & “Liked Radio”
-
-There is a dedicated likes table in the DB and helper functions for:
-
-- Liking/unliking a track
-- Counting likes per track
-- Building “top liked for users” selections
-
-Prefix and/or slash commands are wired to these helpers so you can:
-
-- Like/unlike the currently playing song
-- Build a queue seeded from everyone’s favourites
-
-Use `!help` to see the exact names & usage for your build.
-
-### Slash Commands
-
-The bot automatically syncs slash commands on startup.  
-You should see at least:
-
-- `/play`
-- `/history`
-- `/top`
-- `/history_clear`
-- Any other slash commands exposed by the music cog
-
----
-
-## 🧱 Project Structure
-
-```text
-suno-radio-bot/
-├── dev.py              # Hot-reload wrapper for development
-├── run.py              # Production entry point (loads dotenv and starts bot)
-├── pyproject.toml      # Poetry/metadata (alt dep definition)
-├── requirements.txt    # Primary Python dependencies
-├── suno_radio.db       # Default SQLite DB (can be overridden by env)
+### Project Structure
+```
 ├── src/
-│   ├── bot.py          # Bot setup, help command, cog loading, DB init
+│   ├── bot.py              # Main bot file
 │   ├── cogs/
-│   │   ├── music.py    # Music, queue, Suno, autofill, likes, embeds
-│   │   └── stats.py    # History and top-track commands
-│   ├── data/
-│   │   ├── db.py       # SQLite helpers for tracks/plays/likes
-│   │   └── persistence.py  # JSON guild data (queues/playlists/user mappings)
-│   └── utils/
-│       ├── yt_extractor.py # yt-dlp wrapper / generic extractor
-│       ├── scraper.py      # Suno page/playlist/profile scraper
-│       └── test_speak.py   # TTS helper (macOS + gTTS)
-├── docs/               # (Optional) extra documentation
-└── data/               # Created at runtime, guild_*.json etc.
+│   │   └── music.py        # Music functionality
+│   ├── utils/
+│   │   ├── test_speak.py   # TTS implementation
+│   │   ├── yt_extractor.py # YouTube/SoundCloud scraper
+│   │   └── scraper.py      # Suno scraper
+│   └── data/
+│       └── persistence.py  # Data loading/saving
+├── docs/                   # Documentation
+├── tests/                  # Unit tests
+├── requirements.txt        # Python dependencies
+└── .gitignore             # Ignore rules
 ```
 
----
+### Testing
+```bash
+python -m pytest tests/
+```
 
-## 🔊 TTS Notes (Optional)
+### Key Technologies
+- **discord.py**: Bot framework
+- **PyObjC**: Native macOS TTS (macOS only)
+- **gTTS**: Cross-platform TTS fallback
+- **yt-dlp**: Video/audio extraction
+- **beautifulsoup4**: HTML parsing for Suno
+- **selenium**: Browser automation for JS-heavy sites
 
-TTS is **not required** for normal music playback.
+## TTS Implementation
 
-The helper in `src/utils/test_speak.py`:
+The bot supports two TTS engines:
+- **Primary**: macOS NSSpeechSynthesizer (via PyObjC) for offline, high-quality speech
+- **Fallback**: Google Text-to-Speech (gTTS) for cross-platform compatibility
 
-- Uses **macOS NSSpeechSynthesizer** via `AppKit` when available
-- Falls back to **gTTS** + `ffmpeg` for non-macOS setups
+Audio is processed through FFmpeg for optimal Discord compatibility.
 
-If you want to use `!test_speak`, you’ll need:
+## Permissions
 
-- macOS + `pyobjc` installed **or**
-- `gtts` + `ffmpeg` available on your system
-
----
-
-## 🔐 Discord Permissions
-
-The bot expects at least:
-
+The bot requires these Discord permissions:
 - Send Messages
 - Use Slash Commands
 - Connect
@@ -386,43 +170,50 @@ The bot expects at least:
 - Use Voice Activity
 - Manage Channels (for `create_music_channel`)
 
----
+## Troubleshooting
 
-## 🩹 Troubleshooting
+### Common Issues
 
 **No sound when playing music**
+- Ensure FFmpeg is installed
+- Check bot has `Connect` and `Speak` permissions
+- Verify there's a voice channel connection
 
-- Confirm FFmpeg is installed and on your `PATH`
-- Check the bot has `Connect` and `Speak` permissions
-- Make sure it’s actually in a voice channel
+**TTS doesn't work**
+- On macOS: PyObjC should work automatically
+- Cross-platform: gTTS requires internet connection
+- Check audio file generation in logs
 
-**Queue / persistence issues**
-
-- Ensure the `data/` directory is writable by the bot process
-- If JSON gets corrupted, you may need to delete the affected `data/guild_*.json`
+**Queue/persistence errors**
+- `data/` directory must be writable
+- Check file permissions
+- JSON corruption may need manual cleanup
 
 **Opus errors**
+- May occur on certain systems; bot auto-falls back to raw PCM
 
-- The bot tries to load `libopus` for compressed voice
-- If it fails, it falls back to raw PCM (higher bandwidth but should still work)
+### Debug Mode
+Use `dev.py` for development with additional logging.
 
-**TTS fails**
+## Contributing
 
-- On macOS: confirm `pyobjc` is installed
-- Elsewhere: install `gtts` and confirm `ffmpeg` is available
-
----
-
-## 🤝 Contributing
-
-1. Fork this repository
+1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Add or adjust tests/docs where relevant
+4. Add tests if applicable
 5. Submit a pull request
+
+## License
+
+This project is licensed under the MIT License.
+
+## Support
+
+For issues or questions:
+1. Check existing GitHub issues
+2. Provide detailed error messages from logs
+3. Include your OS, Python version, and bot version
 
 ---
 
-## 📜 License
-
-This project is licensed under the **MIT License**.
+Made with 🎵 using discord.py

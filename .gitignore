@@ -1,7 +1,8 @@
 
-
+# Secrets — never commit real tokens (template: .env.example)
 .env
 .env.bak
+!.env.example
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -129,6 +130,25 @@ Thumbs.db
 .vscode/
 .idea/
 repomix-output.xml
-src/autofill.csv
 
-sync_config.jsonc
+# Cached media files
+songs/
+images/
+
+# Local log files (BOT_LOG_FILE)
+logs/
+
+# Runtime / machine-local state (never commit)
+*.db
+*.db-shm
+*.db-wal
+*.db.bak*
+.backups/
+.cache/
+.cursor/
+data/
+src/autofill.csv
+src/autofill-backup.csv
+src/.bot.lock
+.coverage
+.pytest_cache/

@@ -33,32 +33,6 @@ def _title_link(title: str | None, url: str | None) -> str:
         return f"**[{t}]({u})**"
     return f"**{t}**"
 
-def _embed_recent(rows):
-    import discord, datetime
-    if not rows:
-        return discord.Embed(title="⏯️ Recent Plays", description="No history yet.", color=EMBED_COLOR_ERROR)
-    lines = []
-    for r in rows:
-        started = datetime.datetime.fromtimestamp(int(r["started_at"]), tz=datetime.timezone.utc)
-        when = discord.utils.format_dt(started, style="R")
-        artist = f"by {r['artist']}" if r.get("artist") else ""
-        link = _title_link(r.get("title") or r.get("track_id"), r.get("source_url"))
-        lines.append(f"- {link} {artist} at {when}")
-    return discord.Embed(title="⏯️ Recent Plays", description="\n".join(lines), color=EMBED_COLOR_STATS)
-
-def _embed_top(range_label, rows):
-    import discord
-    if not rows:
-        return discord.Embed(title=f"✨ Top Tracks ({range_label})", description="No plays in that range.", color=EMBED_COLOR_ERROR)
-    lines = []
-    for i, r in enumerate(rows, start=1):
-        artist = f"{r['artist']}" if r.get("artist") else ""
-        link = _title_link(r.get("title") or r.get("track_id"), r.get("source_url"))
-        plays = r["plays"]
-        lines.append(f"{i}. **{link}** by {artist} *({plays} unique plays)*")
-    return discord.Embed(title=f"✨ Top Tracks ({range_label})", description="\n".join(lines), color=EMBED_COLOR_STATS)
-
-
 class PaginatedHistoryView(PaginatedView):
     """
     Paginated view for play history display.
@@ -221,7 +195,7 @@ class Stats(commands.Cog):
         await interaction.response.send_message(embed=view._build_embed(), view=view)
         view.message = await interaction.original_response()
 
-    @commands.command(name="history", help="Show recent radio plays for this server")
+    @commands.command(name="history", aliases=["h"], help="Show recent radio plays for this server")
     async def history_bang(self, ctx: commands.Context, limit: int = 50):
         limit = max(1, min(50, int(limit)))
         rows = recent_plays(guild_id=ctx.guild.id, limit=limit)

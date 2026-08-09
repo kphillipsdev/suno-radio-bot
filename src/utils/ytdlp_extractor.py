@@ -6,14 +6,55 @@ This is separate from the Suno extractor to keep concerns isolated.
 
 import os
 import hashlib
-import tempfile
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Lazy import to avoid startup cost if not used
 _yt_dlp = None
 
 # Directory for downloaded HLS files (tracks that can't be streamed directly)
 YTDLP_DOWNLOAD_DIR = os.getenv("YTDLP_DOWNLOAD_DIR", "songs")
+
+
+class YtDlpExtractionError(Exception):
+    """Raised when yt-dlp extraction fails for a reason the user should see."""
+    pass
+
+
+def _friendly_ytdlp_error(url: str, exc: BaseException) -> str:
+    """Translate noisy yt-dlp errors into messages safe to show to a Discord user."""
+    raw = str(exc)
+    lowered = raw.lower()
+    is_soundcloud = "soundcloud.com" in url.lower()
+
+    # SoundCloud-specific: format-info JSON 404 / no formats found.
+    # These both mean the track is protected (Go+ / all-rights-reserved) or
+    # otherwise not streamable without account cookies.
+    if is_soundcloud and (
+        "unable to download json metadata" in lowered
+        or "no video formats found" in lowered
+        or "no streamable" in lowered
+    ):
+        return (
+            "This SoundCloud track has no free stream available "
+            "(likely Go+ / all-rights-reserved or region-locked, so the bot "
+            "cannot play it without account cookies)"
+        )
+
+    if "private video" in lowered or "private track" in lowered:
+        return "This track is marked private and cannot be played"
+
+    if "geo" in lowered and ("restrict" in lowered or "block" in lowered):
+        return "This track is geo-restricted and cannot be played from this server"
+
+    # Fall back to the raw error, trimmed to something sensible for a Discord
+    # error embed (Discord caps descriptions at 4096 chars but shorter is nicer).
+    raw = raw.replace("\n", " ").strip().rstrip(".")
+    if len(raw) > 300:
+        raw = raw[:297] + "..."
+    return raw
 
 def _get_ytdlp():
     """Lazy load yt-dlp module."""
@@ -45,22 +86,21 @@ def _download_hls_track(url: str, info: dict) -> Optional[str]:
     }
     
     try:
-        print(f"[ytdlp_extractor] Downloading HLS track: {info.get('title', url)[:50]}...")
+        logger.info("Downloading HLS track: %s (%s)", info.get("title", "?"), url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        
-        # Find the downloaded file
+
         for ext in (".mp3", ".m4a", ".opus", ".webm", ".ogg"):
             expected_path = os.path.join(YTDLP_DOWNLOAD_DIR, f"ytdlp_{url_hash}{ext}")
             if os.path.exists(expected_path) and os.path.getsize(expected_path) > 0:
-                print(f"[ytdlp_extractor] Downloaded successfully: {expected_path}")
+                logger.info("Downloaded HLS track to %s", expected_path)
                 return expected_path
-        
-        print(f"[ytdlp_extractor] Download completed but file not found")
+
+        logger.warning("HLS download completed but no output file found for %s", url)
         return None
-        
+
     except Exception as e:
-        print(f"[ytdlp_extractor] HLS download failed: {e}")
+        logger.warning("HLS download failed for %s: %s", url, e)
         return None
 
 
@@ -126,66 +166,72 @@ def extract_with_ytdlp(url: str, download_thumbnail: bool = True) -> Optional[di
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
-                return None
-            
-            # Get the best audio URL
+                raise YtDlpExtractionError(f"yt-dlp returned no metadata for {url}")
+
             audio_url = info.get("url")
-            
-            # Check if the selected URL is HLS - if so, try to find a direct HTTP alternative
+
+            # If the selected URL is HLS, try to find a direct HTTP alternative
             if audio_url and (".m3u8" in audio_url or info.get("protocol") == "m3u8_native"):
                 formats = info.get("formats", [])
                 http_formats = [
-                    f for f in formats 
+                    f for f in formats
                     if f.get("acodec") != "none" and f.get("protocol") in ("http", "https")
                 ]
                 if http_formats:
-                    # Sort by audio bitrate (prefer higher quality)
                     http_formats.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
                     audio_url = http_formats[0].get("url")
-                    print(f"[ytdlp_extractor] Switched from HLS to HTTP format")
-            
+                    logger.info("Switched from HLS to HTTP format for %s", url)
+
             if not audio_url:
-                # Some extractors put the URL in formats
                 formats = info.get("formats", [])
-                # Filter to audio-only formats, prefer HTTP protocol over HLS
                 audio_formats = [f for f in formats if f.get("acodec") != "none"]
-                # Separate HTTP and HLS formats
                 http_formats = [f for f in audio_formats if f.get("protocol") in ("http", "https")]
                 hls_formats = [f for f in audio_formats if f.get("protocol") not in ("http", "https")]
-                
-                # Prefer HTTP formats
+
                 preferred_formats = http_formats if http_formats else hls_formats
                 if preferred_formats:
-                    # Sort by audio bitrate (prefer higher quality)
                     preferred_formats.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
                     audio_url = preferred_formats[0].get("url")
-            
+
             if not audio_url:
-                print(f"[ytdlp_extractor] No audio URL found for {url}")
-                return None
-            
-            # Check if we got an HLS URL that FFmpeg can't stream directly
-            # These require downloading first (common for major label content on SoundCloud)
+                # No streamable URL at all -- usually means the track is protected
+                # (e.g. SoundCloud "all-rights-reserved" / Go+ only, geo-blocked, etc.)
+                formats_count = len(info.get("formats") or [])
+                logger.warning(
+                    "No streamable audio URL for %s (formats=%d, title=%r, license=%r)",
+                    url, formats_count, info.get("title"), info.get("license"),
+                )
+                hint = ""
+                if "soundcloud.com" in url.lower():
+                    hint = (
+                        " This SoundCloud track does not expose a free stream "
+                        "(likely Go+ / all-rights-reserved or region-locked)."
+                    )
+                raise YtDlpExtractionError(
+                    f"No streamable audio formats available for this track.{hint}"
+                )
+
+            # Detect HLS-only tracks (common for major label content on SoundCloud)
+            # that FFmpeg can't stream directly and require downloading first.
             is_hls_only = ".m3u8" in audio_url or info.get("protocol") == "m3u8_native"
             downloaded_file = None
-            
+
             if is_hls_only:
-                # Check if there are ANY http formats we might have missed
                 formats = info.get("formats", [])
                 has_http = any(
                     f.get("protocol") in ("http", "https") and f.get("acodec") != "none"
                     for f in formats
                 )
-                
+
                 if not has_http:
-                    # No HTTP formats available - must download via yt-dlp
-                    print(f"[ytdlp_extractor] Track only has HLS - downloading first...")
+                    logger.info("Track only has HLS streams, downloading first: %s", url)
                     downloaded_file = _download_hls_track(url, info)
                     if downloaded_file:
                         audio_url = downloaded_file
                     else:
-                        print(f"[ytdlp_extractor] Failed to download HLS track")
-                        return None
+                        raise YtDlpExtractionError(
+                            "Failed to download HLS-only track (no direct stream available)."
+                        )
             
             # Extract metadata
             title = info.get("title") or info.get("track") or "Unknown Title"
@@ -236,9 +282,11 @@ def extract_with_ytdlp(url: str, download_thumbnail: bool = True) -> Optional[di
                 "_genre": info.get("genre"),
             }
             
+    except YtDlpExtractionError:
+        raise
     except Exception as e:
-        print(f"[ytdlp_extractor] Extraction failed for {url}: {e}")
-        return None
+        logger.error("yt-dlp extraction failed for %s: %s", url, e)
+        raise YtDlpExtractionError(_friendly_ytdlp_error(url, e)) from e
 
 
 def _download_thumbnail(thumbnail_url: str, source_url: str) -> Optional[str]:
@@ -256,19 +304,7 @@ def _download_thumbnail(thumbnail_url: str, source_url: str) -> Optional[str]:
             referer=source_url
         )
     except Exception as e:
-        print(f"[ytdlp_extractor] Thumbnail download failed: {e}")
+        logger.warning("Thumbnail download failed for %s: %s", source_url, e)
         return None
 
 
-def get_supported_platforms() -> list[str]:
-    """Return a list of known supported platform names for help text."""
-    return [
-        "SoundCloud",
-        "Bandcamp", 
-        "Mixcloud",
-        "Audiomack",
-        "Audius",
-        "Hearthis.at",
-        "Newgrounds Audio",
-        # Note: yt-dlp supports many more, these are just the common audio ones
-    ]

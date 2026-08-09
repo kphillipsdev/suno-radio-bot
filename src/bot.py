@@ -1,4 +1,7 @@
 import os
+import sys
+import fcntl
+import atexit
 from dotenv import load_dotenv
 import discord
 import discord.opus  # For voice support
@@ -9,6 +12,33 @@ import json
 import asyncio
 from src.data.persistence import load_data, save_data
 from src.data.db import init_db
+
+_lock_file = None
+
+def _acquire_instance_lock():
+    """Prevent multiple bot instances via an exclusive file lock."""
+    global _lock_file
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.lock")
+    _lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.write(str(os.getpid()))
+        _lock_file.flush()
+        atexit.register(_release_instance_lock)
+    except BlockingIOError:
+        print(f"FATAL: Another bot instance is already running (lock: {lock_path}). Exiting.")
+        sys.exit(1)
+
+def _release_instance_lock():
+    global _lock_file
+    if _lock_file:
+        try:
+            fcntl.flock(_lock_file, fcntl.LOCK_UN)
+            _lock_file.close()
+        except Exception:
+            pass
+
+_acquire_instance_lock()
 
 
 class MusicHelpCommand(commands.HelpCommand):
@@ -157,7 +187,10 @@ class MusicHelpCommand(commands.HelpCommand):
         lines: list[str] = []
         for cmd in admin_cmds:
             brief = cmd.brief or (cmd.help.splitlines()[0] if cmd.help else "—")
-            line = f"• {self._fmt_sig(cmd)} — {self._shorten(brief, LINE_CHAR_LIMIT)}"
+            alias_str = ""
+            if cmd.aliases:
+                alias_str = " (" + ", ".join(f"`!{a}`" for a in cmd.aliases) + ")"
+            line = f"• {self._fmt_sig(cmd)}{alias_str} — {self._shorten(brief, LINE_CHAR_LIMIT)}"
             lines.append(self._shorten(line, LINE_CHAR_LIMIT + 20))
 
         chunks = self._chunk_lines(lines, FIELD_CHAR_LIMIT) or [["—"]]
@@ -265,7 +298,10 @@ class MusicHelpCommand(commands.HelpCommand):
             lines = []
             for cmd in sorted(visible, key=lambda x: x.qualified_name):
                 short = cmd.brief or (cmd.help.splitlines()[0] if cmd.help else "—")
-                line = f"• {fmt_sig(cmd)} — {_shorten(short, LINE_CHAR_LIMIT)}"
+                alias_str = ""
+                if cmd.aliases:
+                    alias_str = " (" + ", ".join(f"`!{a}`" for a in cmd.aliases) + ")"
+                line = f"• {fmt_sig(cmd)}{alias_str} — {_shorten(short, LINE_CHAR_LIMIT)}"
                 lines.append(_shorten(line, LINE_CHAR_LIMIT + 20))
                 if len(lines) >= 60:
                     lines.append("…")
@@ -327,7 +363,10 @@ class MusicHelpCommand(commands.HelpCommand):
             if self._is_admin_command(command):
                 continue
             brief = command.brief or (command.help.splitlines()[0] if command.help else "—")
-            line = f"• {self._fmt_sig(command)} — {self._shorten(brief, self._LINE_CHAR_LIMIT)}"
+            alias_str = ""
+            if command.aliases:
+                alias_str = " (" + ", ".join(f"`!{a}`" for a in command.aliases) + ")"
+            line = f"• {self._fmt_sig(command)}{alias_str} — {self._shorten(brief, self._LINE_CHAR_LIMIT)}"
             all_lines.append(self._shorten(line, self._LINE_CHAR_LIMIT + 20))
 
         chunks = self._chunk_lines(all_lines, self._FIELD_CHAR_LIMIT) or [["—"]]
@@ -374,6 +413,9 @@ class MusicHelpCommand(commands.HelpCommand):
             description=command.help or ""
         )
         embed.add_field(name="Usage", value=self._fmt_sig(command), inline=False)
+        if command.aliases:
+            alias_list = ", ".join(f"`!{a}`" for a in command.aliases)
+            embed.add_field(name="Shortcuts", value=alias_list, inline=False)
 
         # Subcommands
         if isinstance(command, commands.Group) and command.commands:
@@ -404,8 +446,35 @@ intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=MusicHelpCommand())
 
-import logging, discord
-logging.basicConfig(level=logging.INFO)                 # or DEBUG for deeper
+import logging
+import discord
+from logging.handlers import RotatingFileHandler
+
+_log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_datefmt = "%Y-%m-%d %H:%M:%S"
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+if not _root.handlers:
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(logging.Formatter(_log_format, datefmt=_datefmt))
+    _root.addHandler(_sh)
+
+_log_file = os.getenv("BOT_LOG_FILE", "").strip()
+if _log_file:
+    try:
+        _log_dir = os.path.dirname(os.path.abspath(_log_file))
+        if _log_dir:
+            os.makedirs(_log_dir, exist_ok=True)
+        _max_bytes = int(os.getenv("BOT_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+        _backups = int(os.getenv("BOT_LOG_BACKUPS", "5"))
+        _fh = RotatingFileHandler(
+            _log_file, maxBytes=max(_max_bytes, 1_048_576), backupCount=max(_backups, 1), encoding="utf-8"
+        )
+        _fh.setFormatter(logging.Formatter(_log_format, datefmt=_datefmt))
+        _root.addHandler(_fh)
+    except OSError as e:
+        print(f"Could not open BOT_LOG_FILE {_log_file!r}: {e}")
+
 discord.utils.setup_logging(level=logging.INFO, root=False)
 
 # Optional: make asyncio cancellations less noisy
@@ -439,6 +508,18 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to load stats cog: {e}")
 
+    # Ensure games cog is loaded
+    try:
+        await bot.load_extension('src.cogs.games')
+    except Exception as e:
+        print(f"Failed to load games cog: {e}")
+
+    # Ensure contest cog is loaded
+    try:
+        await bot.load_extension('src.cogs.contest')
+    except Exception as e:
+        print(f"Failed to load contest cog: {e}")
+
     # Voice will use Opus if available
     try:
         discord.opus.load_opus("libopus.so.0")
@@ -461,6 +542,10 @@ async def on_ready():
 
 if __name__ == '__main__':
     async def main():
-        await bot.start(os.getenv('BOT_TOKEN'))
+        try:
+            await bot.start(os.getenv('BOT_TOKEN'))
+        finally:
+            from src.data.db import close_db
+            close_db()
 
     asyncio.run(main())

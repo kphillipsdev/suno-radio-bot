@@ -1,0 +1,19 @@
+[Unit]
+Description=SubotLive Wrapped Web Dashboard
+After=network-online.target subot-live.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=katie
+Group=katie
+WorkingDirectory=/opt/SubotLive
+ExecStart=/opt/SubotLive/venv/bin/uvicorn web.app:app --host 127.0.0.1 --port 8100 --workers 1
+Restart=always
+RestartSec=10
+EnvironmentFile=-/opt/SubotLive/.env
+# Wrapped is off by default in web/app.py (WRAPPED_DASHBOARD_ENABLED). To serve the UI again,
+# set WRAPPED_DASHBOARD_ENABLED=1 in .env. To stop all traffic: systemctl disable --now subot-web.service
+
+[Install]
+WantedBy=multi-user.target

@@ -114,111 +114,102 @@ def fetch_song_data(song_id: str) -> Optional[Dict]:
 # Extraction Functions (maintain compatibility with extractor.py)
 # ============================================================================
 
-def extract_lyrics(soup: BeautifulSoup, html_content: str) -> Optional[str]:
-    """
-    Extract lyrics from Suno page.
-    For API-based extraction, this is a fallback - prefer using scrape_suno_song().
-    """
-    # Try to find song ID from HTML and use API
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            lyrics = data.get('metadata', {}).get('prompt', '')
-            if lyrics:
-                return fix_utf8_encoding(lyrics)
-    
-    # Fallback: try to extract from HTML (legacy support)
+def extract_lyrics(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Optional[str]:
+    """Extract lyrics from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    if data:
+        lyrics = data.get('metadata', {}).get('prompt', '')
+        if lyrics:
+            return fix_utf8_encoding(lyrics)
     return _extract_lyrics_from_html(soup, html_content)
 
 
-def extract_style_prompt(soup: BeautifulSoup, html_content: str) -> Optional[str]:
-    """
-    Extract style prompt/tags from Suno page.
-    For API-based extraction, this is a fallback - prefer using scrape_suno_song().
-    """
-    # Try to find song ID from HTML and use API
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            # metadata.tags contains the full style prompt
-            tags = data.get('metadata', {}).get('tags', '')
-            if tags:
-                return fix_utf8_encoding(tags)
-            # Fallback to display_tags (shorter version)
-            display_tags = data.get('display_tags', '')
-            if display_tags:
-                return fix_utf8_encoding(display_tags)
-    
+def extract_style_prompt(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Optional[str]:
+    """Extract style prompt/tags from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    if data:
+        tags = data.get('metadata', {}).get('tags', '')
+        if tags:
+            return fix_utf8_encoding(tags)
+        display_tags = data.get('display_tags', '')
+        if display_tags:
+            return fix_utf8_encoding(display_tags)
     return None
 
 
-def extract_video_url(soup: BeautifulSoup, html_content: str) -> Optional[str]:
-    """Extract video URL from Suno page."""
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            return data.get('video_url')
-    return None
+def extract_video_url(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Optional[str]:
+    """Extract video URL from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    return data.get('video_url') if data else None
 
 
-def extract_image_url(soup: BeautifulSoup, html_content: str) -> Optional[str]:
-    """Extract image URL from Suno page."""
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            return data.get('image_large_url') or data.get('image_url')
-    return None
+def extract_image_url(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Optional[str]:
+    """Extract image URL from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    return (data.get('image_large_url') or data.get('image_url')) if data else None
 
 
-def extract_model_info(soup: BeautifulSoup, html_content: str) -> Dict[str, Optional[str]]:
-    """Extract model version and name from Suno page."""
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            major_version = data.get('major_model_version', '')
-            model_name = data.get('model_name', '')
-            
-            return {
-                'major_model_version': major_version or None,
-                'model_name': model_name or None
-            }
-    
+def extract_model_info(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Dict[str, Optional[str]]:
+    """Extract model version and name from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    if data:
+        major_version = data.get('major_model_version', '')
+        model_name = data.get('model_name', '')
+        return {
+            'major_model_version': major_version or None,
+            'model_name': model_name or None
+        }
     return {'major_model_version': None, 'model_name': None}
 
 
-def extract_play_count(soup: BeautifulSoup, html_content: str) -> Optional[int]:
-    """Extract play count from Suno page."""
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            return data.get('play_count')
-    return None
+def extract_play_count(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Optional[int]:
+    """Extract play count from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    return data.get('play_count') if data else None
 
 
-def extract_like_count(soup: BeautifulSoup, html_content: str) -> Optional[int]:
-    """Extract like/upvote count from Suno page."""
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            return data.get('upvote_count')
-    return None
+def extract_like_count(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Optional[int]:
+    """Extract like/upvote count from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    return data.get('upvote_count') if data else None
 
 
-def extract_created_at(soup: BeautifulSoup, html_content: str) -> Optional[str]:
-    """Extract created_at timestamp from Suno page."""
-    song_id = extract_song_id(html_content)
-    if song_id:
-        data = fetch_song_data(song_id)
-        if data:
-            return data.get('created_at')
-    return None
+def extract_created_at(soup: BeautifulSoup, html_content: str, *, _data: Optional[Dict] = None) -> Optional[str]:
+    """Extract created_at timestamp from Suno page. Pass _data to avoid redundant API calls."""
+    data = _data
+    if data is None:
+        song_id = extract_song_id(html_content)
+        if song_id:
+            data = fetch_song_data(song_id)
+    return data.get('created_at') if data else None
 
 
 # ============================================================================
