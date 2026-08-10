@@ -147,7 +147,7 @@ logs/
 .cache/
 .cursor/
 data/
-# Live autofill seed is tracked (src/autofill.csv); keep backups / temps local
+src/autofill.csv
 src/autofill-backup.csv
 src/autofill.csv.bak*
 src/autofill.csv.tmp
