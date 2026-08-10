@@ -147,8 +147,11 @@ logs/
 .cache/
 .cursor/
 data/
-src/autofill.csv
+# Live autofill seed is tracked (src/autofill.csv); keep backups / temps local
 src/autofill-backup.csv
+src/autofill.csv.bak*
+src/autofill.csv.tmp
 src/.bot.lock
+!src/autofill.example.csv
 .coverage
 .pytest_cache/
