@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 from src.data.persistence import load_data, save_data
 from src.utils.extractor import extract_song_info, _normalize_suno_short
+from src.utils.smart_scraper import fetch_song_data
 from src.utils.playlist_fast_scraper import get_playlist_links_api
 from src.data.db import (
     like_track, unlike_track, get_like_count, get_user_like_count,
@@ -974,17 +975,15 @@ class RadioBot(commands.Cog, name="Music"):
                 for r in reader:
                     if not r or all(not (c or "").strip() for c in r):
                         continue
-                    if has_header and reader.line_num == 1:
-                        headers = [h.strip().lower() for h in r]
-                        try:
-                            url_idx = headers.index("url")
-                        except ValueError:
-                            url_idx = 0
-                        requested_by_idx = None
-                        for cand in ("requested by", "requested_by", "requestedby", "by"):
-                            if cand in headers:
-                                requested_by_idx = headers.index(cand)
-                                break
+                    headers_lc = [h.strip().lower() for h in r]
+                    # Always skip a real header row (sniffer can miss "Song URL").
+                    is_header_row = (
+                        (has_header and reader.line_num == 1)
+                        or headers_lc[:1] == ["song url"]
+                        or headers_lc[:1] == ["url"]
+                        or (len(headers_lc) >= 2 and headers_lc[1] in ("requested by", "requested_by"))
+                    )
+                    if is_header_row and reader.line_num == 1:
                         continue
 
                     url = (r[0] if len(r) >= 1 else "").strip()
@@ -3638,6 +3637,95 @@ class RadioBot(commands.Cog, name="Music"):
                 out.append((n, r))
         return out
 
+    def _song_id_from_autofill_url(self, url: str) -> str | None:
+        m = self._SUNO_SONG_RE.search(url or "")
+        return m.group(1).lower() if m else None
+
+    def _lookup_track_titles(self, song_ids: list[str]) -> dict[str, str]:
+        """Resolve song_id -> title from the local tracks table (fast path)."""
+        out: dict[str, str] = {}
+        ids = [((s or "").strip().lower()) for s in song_ids if (s or "").strip()]
+        if not ids:
+            return out
+        try:
+            conn = get_conn()
+            for i in range(0, len(ids), 200):
+                chunk = ids[i:i + 200]
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT id, title FROM tracks WHERE lower(id) IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for r in rows:
+                    tid = (r.get("id") or "").strip().lower()
+                    title = (r.get("title") or "").strip()
+                    if tid and title:
+                        out[tid] = title
+        except Exception as e:
+            log.debug("[myrequests] title db lookup failed: %s", e)
+        return out
+
+    async def _resolve_titles_for_rows(
+        self, user_rows: list[tuple[int, dict]]
+    ) -> dict[str, str]:
+        """Map song_id -> title for autofill rows (DB first, clip API fallback)."""
+        ids: list[str] = []
+        for _, r in user_rows:
+            sid = self._song_id_from_autofill_url(r.get("url") or "")
+            if sid:
+                ids.append(sid)
+        titles = self._lookup_track_titles(ids)
+        missing = [sid for sid in ids if sid not in titles]
+        if not missing:
+            return titles
+
+        def _fetch_missing() -> dict[str, str]:
+            got: dict[str, str] = {}
+            # Cap network fan-out; myrequests lists are usually small.
+            for sid in missing[:40]:
+                try:
+                    data = fetch_song_data(sid)
+                except Exception:
+                    data = None
+                title = (data or {}).get("title") if data else None
+                if isinstance(title, str) and title.strip():
+                    got[sid] = title.strip()
+            return got
+
+        try:
+            extra = await asyncio.get_event_loop().run_in_executor(None, _fetch_missing)
+            titles.update(extra)
+        except Exception as e:
+            log.debug("[myrequests] title API fallback failed: %s", e)
+        return titles
+
+    def _format_autofill_row_label(
+        self, row: dict, titles: dict[str, str] | None = None
+    ) -> tuple[str, str]:
+        """Return (display_label, url) for one autofill row."""
+        u = (row.get("url") or "").strip()
+        sid = self._song_id_from_autofill_url(u)
+        title = (titles or {}).get(sid or "") if sid else None
+        if title:
+            label = escape_markdown(_truncate(title, 80))
+        elif sid:
+            label = f"song/{sid[:8]}…"
+        else:
+            label = escape_markdown(_truncate(u, 80)) if u else "Unknown"
+        return label, u
+
+    @staticmethod
+    def _normalize_unrequest_target(target: str) -> str:
+        """Strip common wrappers like `#3` / `3.` so index parsing is forgiving."""
+        t = (target or "").strip()
+        if t.startswith("<") and t.endswith(">"):
+            t = t[1:-1].strip()
+        if t.startswith("#"):
+            t = t[1:].strip()
+        if t.endswith(".") and t[:-1].isdigit():
+            t = t[:-1].strip()
+        return t
+
     async def _resolve_unrequest_target_member(
         self, ctx: commands.Context, hint: str
     ) -> discord.Member | None:
@@ -3696,8 +3784,6 @@ class RadioBot(commands.Cog, name="Music"):
                 await ctx.message.delete()
             except Exception as e:
                 log.debug("[myrequests] could not delete trigger message: %s", e)
-            ack = discord.Embed(description="📬 Sent to your DMs.", color=0x3498db)
-            await ctx.send(embed=ack, delete_after=6)
 
     @commands.hybrid_command(
         name="myrequests",
@@ -3753,17 +3839,25 @@ class RadioBot(commands.Cog, name="Music"):
             await self._send_private_reply(ctx, embed, is_slash=is_slash)
             return
 
-        # Build the listing. Keep each line compact so we don't blow the 4096
-        # char description limit; the per-user cap is small (10) so we should
-        # never hit it, but defend against admin lists growing big.
+        # Resolve titles (local DB first, Suno clip API for any misses).
+        if is_slash and not ctx.interaction.response.is_done():
+            try:
+                await ctx.interaction.response.defer(ephemeral=True, thinking=True)
+            except Exception as e:
+                log.debug("[myrequests] defer failed: %s", e)
+
+        titles = await self._resolve_titles_for_rows(user_rows)
+
+        # Build the listing with song titles so people can manage by name.
+        # Soft-cap lines to stay under the ~4096 char embed description limit.
         lines = []
         for idx, r in user_rows:
-            u = (r.get("url") or "").strip()
-            m = self._SUNO_SONG_RE.search(u)
-            label = f"song/{m.group(1)[:8]}…" if m else u
-            lines.append(f"`{idx:>2}.` [{label}]({u})")
+            label, u = self._format_autofill_row_label(r, titles)
+            if u:
+                lines.append(f"`{idx:>2}.` [{label}]({u})")
+            else:
+                lines.append(f"`{idx:>2}.` {label}")
 
-        # Soft cap to avoid embed overflow (~4096 char description limit).
         MAX_LINES = 40
         truncated = False
         if len(lines) > MAX_LINES:
@@ -3774,8 +3868,9 @@ class RadioBot(commands.Cog, name="Music"):
         if truncated:
             desc += f"\n\n_…showing first {MAX_LINES} of {len(user_rows)}._"
         desc += (
-            "\n\n_Remove one with_ `!unrequest <#>` _or_ `!unrequest <url>`."
-            "\n_Wipe all of yours with_ `!unrequest all`."
+            "\n\n_Remove one with_ `/unrequest <number>` _or_ `/unrequest <url>` "
+            "_(number matches the list above)._"
+            "\n_Wipe all of yours with_ `/unrequest all`."
         )
 
         embed = discord.Embed(title=title, description=desc, color=0x3498db)
@@ -3814,34 +3909,18 @@ class RadioBot(commands.Cog, name="Music"):
                 await ctx.send(embed=embed)
             return
 
-        # Optional channel gate (prefix only) — same as /request.
-        if (
-            not is_slash
-            and REQUEST_CHANNEL_ID
-            and str(ctx.channel.id) != REQUEST_CHANNEL_ID
-        ):
-            try:
-                hint = discord.Embed(
-                    title="Wrong Channel",
-                    description=f"Please use `!unrequest` in <#{REQUEST_CHANNEL_ID}>.",
-                    color=0xe67e22,
-                )
-                await ctx.send(embed=hint, delete_after=10)
-            except Exception as e:
-                log.debug("[unrequest] failed to send channel hint: %s", e)
-            return
-
+        # myrequests / unrequest are allowed in any channel (unlike !request).
         gid = ctx.guild.id
         requester_name = ctx.author.display_name
         is_admin = self._is_admin(ctx.author)
-        target = (target or "").strip()
+        target = self._normalize_unrequest_target(target)
 
         # No arg -> show their list
         if not target:
             await ctx.invoke(self.myrequests)
             return
 
-        # Defer slash response while we touch disk.
+        # Defer slash response while we touch disk / resolve titles.
         if is_slash and not ctx.interaction.response.is_done():
             try:
                 await ctx.interaction.response.defer(ephemeral=True, thinking=True)
@@ -3872,12 +3951,11 @@ class RadioBot(commands.Cog, name="Music"):
                 await _reply(embed)
                 return
 
+            titles = await self._resolve_titles_for_rows(user_rows[:5])
             preview_lines = []
             for idx, r in user_rows[:5]:
-                u = (r.get("url") or "").strip()
-                m = self._SUNO_SONG_RE.search(u)
-                label = f"song/{m.group(1)[:8]}…" if m else u
-                preview_lines.append(f"`{idx:>2}.` [{label}]({u})")
+                label, u = self._format_autofill_row_label(r, titles)
+                preview_lines.append(f"`{idx:>2}.` [{label}]({u})" if u else f"`{idx:>2}.` {label}")
             if len(user_rows) > 5:
                 preview_lines.append(f"_…and {len(user_rows) - 5} more._")
 
@@ -3912,37 +3990,80 @@ class RadioBot(commands.Cog, name="Music"):
                 if not user_rows:
                     embed = discord.Embed(
                         title="ℹ️ Nothing to Remove",
-                        description="You don't have any autofill entries.",
+                        description=(
+                            "You don't have any autofill entries.\n"
+                            "Add some with `/request <suno url>`."
+                        ),
                         color=0x3498db,
                     )
                     await _reply(embed)
                     return
 
                 if idx < 1 or idx > len(user_rows):
-                    embed = discord.Embed(
-                        title="❌ Out of Range",
-                        description=(
-                            f"You only have **{len(user_rows)}** autofill entries. "
-                            f"Use `!myrequests` to see the numbered list."
-                        ),
-                        color=0xe74c3c,
-                    )
-                    await _reply(embed)
-                    return
+                    # Copy rows then release the lock before title lookups / reply.
+                    preview_rows = user_rows[:8]
+                    total = len(user_rows)
+                else:
+                    preview_rows = None
+                    total = len(user_rows)
+                    target_row = user_rows[idx - 1][1]
+                    target_url = (target_row.get("url") or "").strip()
+                    kept = [
+                        r for r in rows
+                        if (r.get("url") or "").strip().lower() != target_url.lower()
+                    ]
+                    removed_count = len(rows) - len(kept)
+                    if removed_count > 0:
+                        self._atomic_write_autofill_csv(path, kept)
+                        self.autofill_seed_rows[gid] = kept[:]
+                        remaining_rows = kept
+                    else:
+                        remaining_rows = rows
+                    remaining = self._user_rows_for(remaining_rows, ctx.author)
 
-                target_url = (user_rows[idx - 1][1].get("url") or "").strip()
-                kept = [r for r in rows if (r.get("url") or "").strip().lower() != target_url.lower()]
-                removed_count = len(rows) - len(kept)
-                if removed_count > 0:
-                    self._atomic_write_autofill_csv(path, kept)
-                    self.autofill_seed_rows[gid] = kept[:]
-                remaining = self._user_rows_for(kept, ctx.author)
+            if preview_rows is not None:
+                titles = await self._resolve_titles_for_rows(preview_rows)
+                preview = []
+                for i, r in preview_rows:
+                    label, _u = self._format_autofill_row_label(r, titles)
+                    preview.append(f"`{i:>2}.` {label}")
+                more = f"\n_…and {total - 8} more._" if total > 8 else ""
+                embed = discord.Embed(
+                    title="❌ Out of Range — Nothing Removed",
+                    description=(
+                        f"`#{idx}` isn't in your list. "
+                        f"You currently have entries **1–{total}**:\n\n"
+                        + "\n".join(preview)
+                        + more
+                        + "\n\nRun `/myrequests` for the full titled list, then "
+                        "`/unrequest <number>`."
+                    ),
+                    color=0xe74c3c,
+                )
+                await _reply(embed)
+                return
 
+            titles = await self._resolve_titles_for_rows([(idx, target_row)])
+            label, _u = self._format_autofill_row_label(target_row, titles)
             cap_display = "∞" if is_admin else str(REQUEST_MAX_PER_USER)
+
+            if removed_count <= 0:
+                embed = discord.Embed(
+                    title="ℹ️ Nothing Removed",
+                    description=(
+                        f"Couldn't remove `#{idx}` ({label}) — it may have "
+                        f"already been taken out of autofill.\n"
+                        f"Run `/myrequests` to refresh your list."
+                    ),
+                    color=0x3498db,
+                )
+                await _reply(embed)
+                return
+
             embed = discord.Embed(
                 title="🗑️ Removed from Autofill",
                 description=(
-                    f"Removed entry `#{idx}`: [{target_url}]({target_url})\n\n"
+                    f"Removed `#{idx}`: [{label}]({target_url})\n\n"
                     f"You now have **{len(remaining)}/{cap_display}** autofill entries."
                 ),
                 color=0x2ecc71,
@@ -3962,15 +4083,23 @@ class RadioBot(commands.Cog, name="Music"):
         )
         if not canonical_url or not song_id:
             embed = discord.Embed(
-                title="❌ Suno Only",
+                title="❌ Couldn't Understand That — Nothing Removed",
                 description=(
-                    "That doesn't look like a Suno song URL.\n"
-                    "Use `!myrequests` to see your numbered list, then "
-                    "`!unrequest <#>`."
+                    "I need a **list number**, a **Suno song URL**, or **`all`**.\n\n"
+                    "Examples:\n"
+                    "• `/unrequest 3` — remove item `#3` from your `/myrequests` list\n"
+                    "• `/unrequest https://suno.com/song/…` — remove that URL\n"
+                    "• `/unrequest all` — clear every one of yours\n\n"
+                    "Song **titles alone** don't work — run `/myrequests` first "
+                    "and use the number next to the song."
                 ),
                 color=0xe74c3c,
             )
             await _reply(embed)
+            log.info(
+                "[unrequest] guild=%s user=%s rejected mode=unparsed target=%r",
+                gid, requester_name, target,
+            )
             return
 
         async with self._get_autofill_csv_lock(gid):
@@ -3988,8 +4117,12 @@ class RadioBot(commands.Cog, name="Music"):
 
             if match_idx < 0:
                 embed = discord.Embed(
-                    title="ℹ️ Not in Autofill",
-                    description="That Suno song isn't currently in the autofill list.",
+                    title="ℹ️ Not in Autofill — Nothing Removed",
+                    description=(
+                        "That Suno song isn't currently in the autofill list "
+                        "(it may already have been removed).\n"
+                        "Check `/myrequests` for your current entries."
+                    ),
                     color=0x3498db,
                 )
                 await _reply(embed)
@@ -3997,10 +4130,11 @@ class RadioBot(commands.Cog, name="Music"):
 
             if not is_admin and not self._row_matches_member(owner_row, ctx.author):
                 embed = discord.Embed(
-                    title="🚫 Not Yours",
+                    title="🚫 Not Yours — Nothing Removed",
                     description=(
                         f"That entry was added by **{escape_markdown(owner or '?')}**. "
-                        f"Only the original requester (or an admin) can remove it."
+                        f"Only the original requester (or an admin) can remove it.\n"
+                        f"Your own songs are listed under `/myrequests`."
                     ),
                     color=0xe74c3c,
                 )
@@ -4012,12 +4146,18 @@ class RadioBot(commands.Cog, name="Music"):
             self.autofill_seed_rows[gid] = rows[:]
             remaining = self._user_rows_for(rows, ctx.author)
 
+        titles = await self._resolve_titles_for_rows([(1, owner_row)])
+        label, _u = self._format_autofill_row_label(owner_row, titles)
         cap_display = "∞" if is_admin else str(REQUEST_MAX_PER_USER)
         embed = discord.Embed(
             title="🗑️ Removed from Autofill",
             description=(
-                f"Removed [`song/{song_id[:8]}…`]({canonical_url})"
-                + (f" (was added by **{escape_markdown(owner or '?')}**)" if is_admin and not self._row_matches_member(owner_row, ctx.author) else "")
+                f"Removed [{label}]({canonical_url})"
+                + (
+                    f" (was added by **{escape_markdown(owner or '?')}**)"
+                    if is_admin and not self._row_matches_member(owner_row, ctx.author)
+                    else ""
+                )
                 + f"\n\nYou now have **{len(remaining)}/{cap_display}** autofill entries."
             ),
             color=0x2ecc71,
